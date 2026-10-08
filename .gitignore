@@ -1,0 +1,9 @@
+.vscode
+
+input/
+output/
+
+watchface/*/output/
+
+*.log
+.DS_Store
