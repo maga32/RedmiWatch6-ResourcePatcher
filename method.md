@@ -241,14 +241,15 @@ NuttX `dd`의 `verify` 옵션은 RW6 `/dev/resource` 부분 기록에서 변경�
 dd ... verify conv=notrunc
 ```
 
-기록 후 같은 범위를 별도 파일로 읽는다.
+기록 후 워치에서 같은 범위를 임시 파일로 다시 읽는다.
 
 ```sh
-dd if=/dev/resource of=/data/r \
+dd if=/dev/resource of=/data/tmp-patch/readback.tmp \
   bs=65536 skip=1472 count=4
+cmp /data/tmp-patch/patch.part001 /data/tmp-patch/readback.tmp
 ```
 
-호스트에서 크기, SHA-256과 바이트가 payload와 모두 같은지 확인한다. 검증이 끝나면 `miwear`를 강제로 종료하지 않고 정상 재부팅해 새 리소스를 로드한다.
+각 조각을 기록한 뒤 생성된 검증 쉘이 같은 범위를 다시 읽고, 원본 조각과 `cmp`로 즉시 비교한다. 모든 조각의 비교가 성공한 경우에만 완료로 처리한다. 검증이 끝나면 `miwear`를 강제로 종료하지 않고 정상 재부팅해 새 리소스를 로드한다.
 
 ## 11. 슈퍼블록 체크섬
 
@@ -295,14 +296,14 @@ MiSans-Regular → 재부팅
 messages.mo → 재부팅
 ```
 
-패치는 `patch.partNNN`, 복원은 `restore.partNNN`을 `/data/tmp-patch/`에 개별 파일로 받으며 별도 payload로 결합하지 않는다. 다운로드와 기록은 버튼 한 번에 각각 최대 5개씩 처리한다.
+패치는 `patch.partNNN`, 복원은 `restore.partNNN`을 `/data/tmp-patch/`에 개별 파일로 받으며 별도 payload로 결합하지 않는다. 다운로드만 버튼 한 번에 최대 5개씩 처리한다. 한 파일의 조각을 모두 받은 뒤 설치 쉘이 전체 조각을 기록하고, 다음 타이머에서 검증 쉘이 전체 조각을 다시 읽어 비교한다.
 
 ```text
 조각 다운로드 → 크기 확인 → manifest의 bs/seek/count로 기록
              → 같은 범위 재읽기 → cmp → 임시 조각 삭제
 ```
 
-JS는 각 파일에 `patch.sh`, `patch-verify.sh`, `restore.sh`, `restore-verify.sh`를 함께 생성한다. 설치 쉘은 헤더가 없는 조각을 먼저 기록하고 ROMFS 엔트리 헤더가 든 조각을 마지막에 기록한다. Lua는 긴 명령행을 조립하지 않고 짧은 `sh <파일>`만 실행한다. 설치와 검증은 서로 다른 LVGL 타이머에서 실행하며, 상태 파일의 모든 성공 표시를 확인한 뒤에만 완료로 처리한다.
+JS는 각 파일에 `patch.sh`, `patch-verify.sh`, `restore.sh`, `restore-verify.sh`를 함께 생성한다. 설치 쉘은 헤더가 없는 조각을 먼저 기록하고 ROMFS 엔트리 헤더가 든 조각을 마지막에 기록한다. Lua는 긴 명령행을 조립하지 않고 짧은 `sh <파일>`만 실행한다. NuttX에서는 성공한 쉘도 `os.execute()` 반환값이 일반 Lua와 다를 수 있으므로 반환값은 성공 판정에 사용하지 않는다. 설치와 검증은 서로 다른 LVGL 타이머에서 실행하며, 상태 파일의 모든 성공 표시를 확인한 뒤에만 완료로 처리한다.
 
 manifest와 기기 정보는 `/tmp/patch/`에 두고, 다운로드 조각과 readback 파일은 `/data/tmp-patch/`에 둔다. 다음 파일 다운로드를 시작할 때 `/data/tmp-patch/`의 패치 임시 파일을 비운다. 재부팅 후 진행 상태를 복구하기 위해 `/data/rw6patch.state`를 별도로 저장한다.
 
@@ -313,7 +314,7 @@ kor-patch.patch 또는 kor-patch.restore
 다음 파일 번호(0~4)
 ```
 
-저장된 작업 이름·제품·버전이 현재 작업과 다르면 번호를 0으로 초기화하고 현재 정보로 덮어쓴다. 한 파일의 모든 조각을 기록하고 검증한 뒤에만 다음 번호를 저장하고 재부팅한다. 예상하지 못한 재부팅에서는 번호가 올라가지 않으므로 같은 파일을 처음부터 다시 처리한다. 단일 `os.execute()` 작업은 10초 안에 완료가 예상되는 크기로 제한한다.
+저장된 작업 이름·제품·버전이 현재 작업과 다르면 번호를 0으로 초기화하고 현재 정보로 덮어쓴다. 한 파일의 모든 조각을 기록하고 검증한 뒤에만 다음 번호를 저장하고, 완료 문구를 표시한 다음 5초 뒤 재부팅한다. 예상하지 못한 재부팅에서는 번호가 올라가지 않으므로 같은 파일을 처음부터 다시 처리한다. 단일 `os.execute()` 작업은 10초 안에 완료가 예상되는 크기로 제한한다.
 
 ## 14. 도구 출력과 필수 검증
 

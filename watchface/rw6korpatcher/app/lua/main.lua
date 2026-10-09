@@ -27,15 +27,13 @@ local busy, timer, downloadState = false, nil, nil
 
 -- 최상위 function부 선언
 local newButton, log, read, size, exec, jsonString, jsonNumber, chunkInfo, statusComplete, actionName,
-    operationId, saveProgress, loadProgress, rebootWatch, later, runOperation, getInfo,
+    operationId, saveProgress, loadProgress, clearTemporary, rebootWatch, later, runOperation, getInfo,
     checkAvailability, downloadBatch, installCurrent
 
 local logText = table.concat({
     "레드미워치6 내수용 한글패치 (by. 룽즈)",
     " - 패치방법 : 정보확인 -> 패치",
     " - 복원방법 : 정보확인 -> 복원",
-    "",
-    " - 설정-화면꺼짐시간을 최대한 길게 적용한 후 진행하시는편이 좋습니다",
     "",
     "- 개발자는 이 툴의 사용으로 발생한 기기 손상 등에 대한 책임을 지지 않습니다.",
 }, "\n")
@@ -47,11 +45,17 @@ local root = lvgl.Object(nil, {
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
 root:add_flag(lvgl.FLAG.EVENT_BUBBLE)
 
+local warning = lvgl.Label(root, {
+    x = margin+10, y = 50, w = contentWidth, h = 50,
+    text = "*설정-디스플레이-자동잠금시간을 최대한 길게 적용하면 중단위험이 적어집니다.",
+    text_color = "#ffd166", text_font = lvgl.Font("MiSans-Medium", 18),
+})
+
 local logView = lvgl.Textarea(root, {
-    x = margin, y = 50, w = contentWidth, h = buttonY - 58,
+    x = margin, y = 100, w = contentWidth, h = buttonY - 108,
     text = logText, radius = 10, border_width = 1,
     border_color = "#454a55", bg_color = "#252830",
-    text_color = "#e2e5eb", text_font = lvgl.Font("MiSans-Regular", 18),
+    text_color = "#e2e5eb", text_font = lvgl.Font("MiSans-Medium", 18),
     pad_all = 12, pad_bottom = 50,
 })
 logView:add_flag(lvgl.FLAG.SCROLLABLE)
@@ -68,7 +72,7 @@ function newButton(index, text, color)
     local label = lvgl.Label(object, {
         text = text, align = lvgl.ALIGN.CENTER, border_width = 0,
         bg_opa = 0, text_color = color,
-        text_font = lvgl.Font("MiSans-Regular", 18),
+        text_font = lvgl.Font("MiSans-Medium", 18),
     })
     return { object = object, label = label }
 end
@@ -187,12 +191,28 @@ function loadProgress()
     return index
 end
 
+-- NuttX 셸의 glob에 의존하지 않고 이전 단계 임시 파일 삭제
+function clearTemporary()
+    for index = 0, 99 do
+        local number = string.format("%03d", index)
+        os.remove(downloadDir .. "/patch.part" .. number)
+        os.remove(downloadDir .. "/restore.part" .. number)
+        os.remove(readbackPath .. index)
+    end
+    for _, name in ipairs({
+        "patch.sh", "patch-verify.sh", "restore.sh", "restore-verify.sh",
+        "install.status", "verify.status", "medium.status", "readback.tmp",
+    }) do
+        os.remove(downloadDir .. "/" .. name)
+    end
+end
+
 -- 상태 저장 후 화면 로그를 갱신하고 워치 재부팅
 function rebootWatch(message)
-    log(message .. "\n재부팅합니다.")
+    log(message .. "\n5초뒤 자동으로 재부팅합니다.")
     busy = true
     timer = lvgl.Timer {
-        period = 300, repeat_count = 1,
+        period = 5000, repeat_count = 1,
         cb = function()
             timer = nil
             os.execute("reboot")
@@ -292,14 +312,14 @@ function checkAvailability()
             or not string.find(manifest, '"format":"rw6-romfs-entry-patch-v1"', 1, true) then
             itemIndex = 1
             phase = "ready"
-            log("현재 패치 또는 복원이 불가능한 버전입니다. 다시 시도해보거나 네이버 카페에 문의해주세요.")
+            log("휴대폰과의 연결이 불안정하거나 현재 작업이 불가능한 버전입니다. 다시 시도해보거나 네이버 카페에 문의해주세요.")
             return
         end
     end
     local progress = loadProgress()
     if progress == fileCount then
         phase = "done"
-        log("이미 모든 " .. actionName() .. "가 완료된 상태입니다.")
+        log("이미 모든 " .. actionName() .. " 작업이 완료된 상태입니다.")
         return
     end
     itemIndex = progress + 1
@@ -308,7 +328,7 @@ function checkAvailability()
     restoreButton.object:add_flag(lvgl.FLAG.HIDDEN)
     patchButton.object:set { x = margin, w = contentWidth }
     patchButton.label:set { text = actionName() }
-    log("해당버전 " .. actionName() .. "가 존재합니다. 한번 더 "
+    log("해당버전 " .. actionName() .. " 작업이 존재합니다. 한번 더 "
         .. actionName() .. "버튼을 눌러주세요.")
 end
 
@@ -326,9 +346,7 @@ function downloadBatch()
 
     local signature = operation .. "/" .. itemIndex
     if not downloadState or downloadState.signature ~= signature then
-        exec("rm " .. downloadDir .. "/patch.part* "
-            .. downloadDir .. "/restore.part* " .. downloadDir .. "/*.sh "
-            .. downloadDir .. "/*.status " .. readbackPath .. "*")
+        clearTemporary()
         downloadState = { signature = signature, index = 0 }
     end
     if downloadState.index == 0 then
@@ -425,8 +443,8 @@ function installCurrent()
     local installStatus = downloadDir .. "/install.status"
     local verifyStatus = downloadDir .. "/verify.status"
     os.remove(installStatus)
-    if not exec("sh " .. installPath)
-        or not statusComplete(installStatus, "W", chunkCount) then
+    os.execute("sh " .. installPath)
+    if not statusComplete(installStatus, "W", chunkCount) then
         error("전체 기록에 실패했습니다.")
     end
 
@@ -435,15 +453,13 @@ function installCurrent()
         cb = function()
             timer = nil
             os.remove(verifyStatus)
-            if not exec("sh " .. verifyPath)
-                or not statusComplete(verifyStatus, "V", chunkCount) then
+            os.execute("sh " .. verifyPath)
+            if not statusComplete(verifyStatus, "V", chunkCount) then
                 busy = false
                 log("전체 검증에 실패했습니다. 다시 시도해주세요.")
                 return
             end
-            exec("rm " .. downloadDir .. "/patch.part* "
-                .. downloadDir .. "/restore.part* " .. downloadDir .. "/*.sh "
-                .. downloadDir .. "/*.status " .. readbackPath .. "*")
+            clearTemporary()
             downloadState = nil
             if not saveProgress(itemIndex) then
                 busy = false
@@ -452,9 +468,9 @@ function installCurrent()
             end
             phase = "reboot"
             if itemIndex == fileCount then
-                rebootWatch("모든 " .. actionName() .. "가 완료되었습니다.")
+                rebootWatch("모든 " .. actionName() .. " 작업이 완료되었습니다.")
             else
-                rebootWatch(currentName .. " 파일 " .. actionName() .. "가 완료되었습니다.")
+                rebootWatch(currentName .. " 파일 " .. actionName() .. " 작업이 완료되었습니다.")
             end
         end,
     }
