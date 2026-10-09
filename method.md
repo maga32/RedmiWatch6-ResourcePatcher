@@ -278,6 +278,9 @@ dataOffset + newSize <= originalAllocatedEnd
 
 ## 13. Lua 워치페이스 적용
 
+워치페이스에 포함되는 `watchface/rw6korpatcher/app/lua/main.lua`는 화면을 표시하고 최신 Lua를 불러오는 로더다.<br>
+실제 패치 화면과 동작은 GitHub Raw의 `lua/rw6-main.lua`를 내려받아 실행하므로 이하의 Lua는 `rw6-main.lua`의 설명이다.
+
 배포 구조는 네 파일별 디렉터리로 구성한다. 버전 디렉터리 바로 아래에는 별도 manifest를 두지 않는다.
 
 ```text
