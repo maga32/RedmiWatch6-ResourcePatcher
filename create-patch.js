@@ -411,7 +411,57 @@ function verifyChunkLayout(item, chunks) {
     }
 }
 
-function createItemManifest(originalImage, item, patchChunks, restoreChunks) {
+function commitChunkIndexes(item, chunks) {
+    const indexes = [item.target].map((target) => (
+        chunks.findIndex((chunk) => (
+            target.entry.offset >= chunk.deviceOffset
+            && target.entry.offset < chunk.deviceOffset + chunk.data.length
+        ))
+    ));
+    if (indexes.some((index) => index < 0)) {
+        throw new Error(`헤더 조각을 찾지 못함: ${item.outputPath}`);
+    }
+    return indexes;
+}
+
+function createScripts(item, chunks, prefix) {
+    const commit = new Set(commitChunkIndexes(item, chunks));
+    const order = [
+        ...chunks.filter((_, index) => !commit.has(index)),
+        ...chunks.filter((_, index) => commit.has(index)),
+    ];
+    const installStatus = '/data/tmp-patch/install.status';
+    const verifyStatus = '/data/tmp-patch/verify.status';
+    const readback = '/data/tmp-patch/readback.tmp';
+    const install = ['set +e', `echo INSTALL_START >${installStatus}`];
+    const verify = ['set +e', `echo VERIFY_START >${verifyStatus}`];
+
+    for (const chunk of order) {
+        const index = chunks.indexOf(chunk);
+        const marker = String(index).padStart(3, '0');
+        install.push(
+            `if dd if=/data/tmp-patch/${chunk.name} of=/dev/resource bs=${chunk.blockSize} seek=${chunk.seek} count=${chunk.count} conv=notrunc; then echo W${marker}_OK >>${installStatus}; fi`,
+        );
+    }
+    for (let index = 0; index < chunks.length; index += 1) {
+        const chunk = chunks[index];
+        const marker = String(index).padStart(3, '0');
+        verify.push(
+            `rm ${readback}`,
+            `dd if=/dev/resource of=${readback} bs=${chunk.blockSize} skip=${chunk.seek} count=${chunk.count}`,
+            `if cmp /data/tmp-patch/${chunk.name} ${readback}; then echo V${marker}_OK >>${verifyStatus}; fi`,
+        );
+    }
+    verify.push(`rm ${readback}`);
+
+    return {
+        install: Buffer.from(`${install.join('\n')}\n`),
+        verify: Buffer.from(`${verify.join('\n')}\n`),
+        prefix,
+    };
+}
+
+function createItemManifest(originalImage, item, patchChunks, restoreChunks, scripts) {
     const number = (value) => ({ decimal: value, hex: hex(value) });
     const commitChunks = [item.target].map((target) => (
         patchChunks.findIndex((chunk) => (
@@ -471,6 +521,14 @@ function createItemManifest(originalImage, item, patchChunks, restoreChunks) {
             fastBlockSize: FAST_BLOCK_SIZE,
             edgeBlockSize: EDGE_BLOCK_SIZE,
             forbiddenOption: 'verify',
+            patchScript: 'patch.sh',
+            patchScriptSize: scripts.patch.install.length,
+            patchVerifyScript: 'patch-verify.sh',
+            patchVerifyScriptSize: scripts.patch.verify.length,
+            restoreScript: 'restore.sh',
+            restoreScriptSize: scripts.restore.install.length,
+            restoreVerifyScript: 'restore-verify.sh',
+            restoreVerifyScriptSize: scripts.restore.verify.length,
         },
     };
 }
@@ -485,11 +543,16 @@ async function writeOutputs(originalImage, items) {
         const restoreChunks = splitPayload(item.restorePayload, 'restore', item.rangeStart);
         verifyChunkLayout(item, patchChunks);
         verifyChunkLayout(item, restoreChunks);
+        const scripts = {
+            patch: createScripts(item, patchChunks, 'patch'),
+            restore: createScripts(item, restoreChunks, 'restore'),
+        };
         const manifest = createItemManifest(
             originalImage,
             item,
             patchChunks,
             restoreChunks,
+            scripts,
         );
         const outputDirectory = path.join(OUTPUT, item.outputPath);
 
@@ -505,6 +568,14 @@ async function writeOutputs(originalImage, items) {
                 chunk.data,
                 { flag: 'wx', mode: 0o600 },
             )),
+            fsp.writeFile(path.join(outputDirectory, 'patch.sh'), scripts.patch.install,
+                { flag: 'wx', mode: 0o600 }),
+            fsp.writeFile(path.join(outputDirectory, 'patch-verify.sh'), scripts.patch.verify,
+                { flag: 'wx', mode: 0o600 }),
+            fsp.writeFile(path.join(outputDirectory, 'restore.sh'), scripts.restore.install,
+                { flag: 'wx', mode: 0o600 }),
+            fsp.writeFile(path.join(outputDirectory, 'restore-verify.sh'), scripts.restore.verify,
+                { flag: 'wx', mode: 0o600 }),
             fsp.writeFile(
                 path.join(outputDirectory, 'manifest.json'),
                 `${JSON.stringify(manifest)}\n`,
@@ -518,10 +589,17 @@ async function writeOutputs(originalImage, items) {
         const writtenRestore = Buffer.concat(await Promise.all(
             restoreChunks.map((chunk) => fsp.readFile(path.join(outputDirectory, chunk.name))),
         ));
+        const writtenScripts = await Promise.all([
+            'patch.sh', 'patch-verify.sh', 'restore.sh', 'restore-verify.sh',
+        ].map((name) => fsp.readFile(path.join(outputDirectory, name))));
         if (!writtenPatch.equals(item.patchPayload)
             || !writtenRestore.equals(item.restorePayload)
             || sha256(writtenPatch) !== manifest.payload.patchSha256
-            || sha256(writtenRestore) !== manifest.payload.restoreSha256) {
+            || sha256(writtenRestore) !== manifest.payload.restoreSha256
+            || !writtenScripts[0].equals(scripts.patch.install)
+            || !writtenScripts[1].equals(scripts.patch.verify)
+            || !writtenScripts[2].equals(scripts.restore.install)
+            || !writtenScripts[3].equals(scripts.restore.verify)) {
             await fsp.rm(OUTPUT, { recursive: true, force: true });
             throw new Error(`조각 출력 파일 재결합 검증 실패: ${item.outputPath}`);
         }

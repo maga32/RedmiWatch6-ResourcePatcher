@@ -8,24 +8,27 @@ local buttonY = H - 50 - buttonHeight
 local buttonWidth = (contentWidth - gap * 2) // 3
 
 local workDir = "/tmp/patch"
-local readbackPath = workDir .. "/readback.tmp"
+local downloadDir = "/data/tmp-patch"
+local readbackPath = downloadDir .. "/readback.tmp"
+local statePath = "/data/rw6patch.state"
 local baseUrl = "https://raw.githubusercontent.com/maga32/RedmiWatch6-ResourcePatcher/main/patches/"
 os.remove(readbackPath)
 
 -- 기기 및 작업 상태
 local device, version, productId, operation, packageUrl, currentName
 local itemManifests = {
-    "messages/manifest.json",
-    "font/MiSans-Regular/manifest.json",
     "font/MiSans-Medium/manifest.json",
     "font/MiSans-Demibold/manifest.json",
+    "font/MiSans-Regular/manifest.json",
+    "messages/manifest.json",
 }
 local phase, itemIndex, fileCount, installPosition = "need-info", 1, #itemManifests, 0
 local busy, timer, downloadState = false, nil, nil
 
 -- 최상위 function부 선언
-local newButton, log, read, size, exec, jsonString, jsonNumber, chunkInfo, actionName, later,
-    runOperation, getInfo, checkAvailability, downloadBatch, installCurrent
+local newButton, log, read, size, exec, jsonString, jsonNumber, chunkInfo, statusComplete, actionName,
+    operationId, saveProgress, loadProgress, rebootWatch, later, runOperation, getInfo,
+    checkAvailability, downloadBatch, installCurrent
 
 local logText = table.concat({
     "레드미워치6 내수용 한글패치 (by. 룽즈)",
@@ -48,7 +51,7 @@ local logView = lvgl.Textarea(root, {
     x = margin, y = 50, w = contentWidth, h = buttonY - 58,
     text = logText, radius = 10, border_width = 1,
     border_color = "#454a55", bg_color = "#252830",
-    text_color = "#e2e5eb", text_font = lvgl.Font("MiSans-Medium", 18),
+    text_color = "#e2e5eb", text_font = lvgl.Font("MiSans-Regular", 18),
     pad_all = 12, pad_bottom = 50,
 })
 logView:add_flag(lvgl.FLAG.SCROLLABLE)
@@ -65,7 +68,7 @@ function newButton(index, text, color)
     local label = lvgl.Label(object, {
         text = text, align = lvgl.ALIGN.CENTER, border_width = 0,
         bg_opa = 0, text_color = color,
-        text_font = lvgl.Font("MiSans-Medium", 18),
+        text_font = lvgl.Font("MiSans-Regular", 18),
     })
     return { object = object, label = label }
 end
@@ -118,7 +121,7 @@ function size(path)
     return value
 end
 
--- 셸 명령 실행후 성공 여부 리턴
+-- 쉘 명령 실행후 성공 여부 리턴
 function exec(command)
     local result, _, status = os.execute(command)
     return result == 0 or (result == true and (status == nil or status == 0))
@@ -141,8 +144,61 @@ function chunkInfo(manifest, prefix, index)
         jsonNumber(body, "seek"), jsonNumber(body, "count")
 end
 
+-- 쉘 상태 파일에 모든 청크의 성공 표시가 있는지 확인
+function statusComplete(path, prefix, count)
+    local status = read(path)
+    if not status then return false end
+    for index = 0, count - 1 do
+        local marker = prefix .. string.format("%03d", index) .. "_OK"
+        if not string.find(status, marker, 1, true) then return false end
+    end
+    return true
+end
+
 -- 현재 작업 모드 리턴
 function actionName() return operation == "restore" and "복원" or "패치" end
+
+-- 현재 패치 또는 복원의 고유 이름
+function operationId()
+    return operation == "restore" and "kor-patch.restore" or "kor-patch.patch"
+end
+
+-- 재부팅 후 이어갈 작업 정보와 0부터 시작하는 다음 파일 번호 저장
+function saveProgress(index)
+    local file = io.open(statePath, "wb")
+    if not file then return false end
+    file:write(operationId(), "\n", productId, "\n", version, "\n", index, "\n")
+    file:close()
+    return true
+end
+
+-- 같은 작업은 이어가고 다른 패치·제품·버전이면 0부터 다시 시작
+function loadProgress()
+    local state = read(statePath) or ""
+    local savedId, savedProduct, savedVersion, savedIndex =
+        string.match(state, "([^\n]+)\n([^\n]+)\n([^\n]+)\n(%d+)")
+    local index = tonumber(savedIndex)
+
+    if savedId ~= operationId() or savedProduct ~= productId or savedVersion ~= version
+        or not index or index < 0 or index > fileCount then
+        index = 0
+        if not saveProgress(index) then error("진행 상태를 저장할 수 없습니다.") end
+    end
+    return index
+end
+
+-- 상태 저장 후 화면 로그를 갱신하고 워치 재부팅
+function rebootWatch(message)
+    log(message .. "\n재부팅합니다.")
+    busy = true
+    timer = lvgl.Timer {
+        period = 300, repeat_count = 1,
+        cb = function()
+            timer = nil
+            os.execute("reboot")
+        end,
+    }
+end
 
 -- 로그 먼저 갱신 후 작업실행, 중복 입력 방지
 function later(action)
@@ -202,6 +258,10 @@ function getInfo()
         log("\n정보확인에 실패했습니다. 다시 시도해주세요.")
         return
     end
+    if not exec("test -d " .. downloadDir) and not exec("mkdir " .. downloadDir) then
+        log("\n정보확인에 실패했습니다. 다시 시도해주세요.")
+        return
+    end
 
     os.execute("uname -n >" .. workDir .. "/device")
     os.execute("getprop ro.build.version >" .. workDir .. "/version")
@@ -236,7 +296,13 @@ function checkAvailability()
             return
         end
     end
-    itemIndex = 1
+    local progress = loadProgress()
+    if progress == fileCount then
+        phase = "done"
+        log("이미 모든 " .. actionName() .. "가 완료된 상태입니다.")
+        return
+    end
+    itemIndex = progress + 1
     phase = "download"
     infoButton.object:add_flag(lvgl.FLAG.HIDDEN)
     restoreButton.object:add_flag(lvgl.FLAG.HIDDEN)
@@ -246,7 +312,7 @@ function checkAvailability()
         .. actionName() .. "버튼을 눌러주세요.")
 end
 
--- 3 다운로드: 현재 파일의 청크를 한 번에 최대 7개씩 받기
+-- 3 다운로드: 현재 파일의 청크를 한 번에 최대 5개씩 받기
 function downloadBatch()
     local manifest = read(workDir .. "/file-" .. itemIndex .. ".json")
     if not manifest then error("manifest를 읽을 수 없습니다.") end
@@ -260,7 +326,9 @@ function downloadBatch()
 
     local signature = operation .. "/" .. itemIndex
     if not downloadState or downloadState.signature ~= signature then
-        exec("rm " .. workDir .. "/patch.part* " .. workDir .. "/restore.part*")
+        exec("rm " .. downloadDir .. "/patch.part* "
+            .. downloadDir .. "/restore.part* " .. downloadDir .. "/*.sh "
+            .. downloadDir .. "/*.status " .. readbackPath .. "*")
         downloadState = { signature = signature, index = 0 }
     end
     if downloadState.index == 0 then
@@ -273,6 +341,22 @@ function downloadBatch()
     local function nextChunk()
         local index = downloadState.index
         if index >= chunkCount then
+            local installName = jsonString(manifest, prefix .. "Script")
+            local installSize = jsonNumber(manifest, prefix .. "ScriptSize")
+            local verifyName = jsonString(manifest, prefix .. "VerifyScript")
+            local verifySize = jsonNumber(manifest, prefix .. "VerifyScriptSize")
+            local directory = string.match(itemManifests[itemIndex], "^(.*)/manifest.json$")
+            local installPath = installName and downloadDir .. "/" .. installName or ""
+            local verifyPath = verifyName and downloadDir .. "/" .. verifyName or ""
+            if not installName or not installSize or not verifyName or not verifySize or not directory
+                or not exec("curl " .. packageUrl .. directory .. "/" .. installName .. " -o" .. installPath)
+                or size(installPath) ~= installSize
+                or not exec("curl " .. packageUrl .. directory .. "/" .. verifyName .. " -o" .. verifyPath)
+                or size(verifyPath) ~= verifySize then
+                busy = false
+                log("실행 파일 다운로드에 실패했습니다. 다시 시도해주세요.")
+                return
+            end
             phase = "install"
             installPosition = 0
             busy = false
@@ -282,11 +366,11 @@ function downloadBatch()
 
         timer = lvgl.Timer {
             period = 100, repeat_count = 1,
-            -- 예약된 청크를 내려받아 기존 payload 뒤에 결합
+            -- 예약된 청크를 패치 전용 임시 폴더에 내려받기
             cb = function()
                 timer = nil
                 local filename, expected = chunkInfo(manifest, prefix, index)
-                local part = workDir .. "/" .. (filename or "invalid")
+                local part = downloadDir .. "/" .. (filename or "invalid")
                 local directory = string.match(itemManifests[itemIndex], "^(.*)/manifest.json$")
                 os.remove(part)
                 if not filename or not directory
@@ -302,7 +386,7 @@ function downloadBatch()
                 log("다운로드중 " .. downloadState.index .. "/" .. chunkCount)
                 if downloadState.index >= chunkCount then
                     nextChunk()
-                elseif completed >= 7 then
+                elseif completed >= 5 then
                     busy = false
                     log("다운로드를 계속하려면 " .. actionName() .. "버튼을 눌러주세요.")
                 else
@@ -316,106 +400,63 @@ function downloadBatch()
     return true
 end
 
--- 4 설치: 현재 파일의 청크를 지정된 16/64KiB 단위로 기록·검증
+-- 4 설치: JS가 생성한 쉘로 전체 기록 후 다음 타이머에서 전체 검증
 function installCurrent()
     local manifest = read(workDir .. "/file-" .. itemIndex .. ".json")
-    if installPosition == 0 then
-        log(currentName .. " 파일을 " .. actionName() .. "합니다.")
-    end
+    log(currentName .. " 파일을 " .. actionName() .. "합니다.")
 
     local prefix = operation == "restore" and "restore" or "patch"
-    local deviceName = manifest and jsonString(manifest, "device")
     local chunkCount = manifest and jsonNumber(manifest, prefix .. "ChunkCount")
-    local commitChunks = manifest and jsonString(manifest, "commitChunks")
+    local installName = manifest and jsonString(manifest, prefix .. "Script")
+    local verifyName = manifest and jsonString(manifest, prefix .. "VerifyScript")
     if jsonString(manifest or "", "transfer") ~= "chunks"
-        or deviceName ~= "/dev/resource" or not chunkCount or not commitChunks then
+        or not chunkCount or not installName or not verifyName then
         error("manifest가 올바르지 않습니다.")
     end
 
-    local commit, order = {}, {}
-    for value in string.gmatch(commitChunks, "%d+") do
-        commit[tonumber(value)] = true
-    end
     for index = 0, chunkCount - 1 do
-        if not commit[index] then order[#order + 1] = index end
-    end
-    for index = 0, chunkCount - 1 do
-        if commit[index] then order[#order + 1] = index end
-    end
-    local completed = 0
-    busy = true
-
-    local function fail(message)
-        os.remove(readbackPath)
-        busy = false
-        log(actionName() .. "에 실패하였습니다. 다시 시도해주세요.\n오류: " .. message)
+        local filename, expected = chunkInfo(manifest, prefix, index)
+        local part = filename and downloadDir .. "/" .. filename or ""
+        if not filename or size(part) ~= expected then error("분할 파일이 올바르지 않습니다.") end
     end
 
-    local function finish()
-        exec("rm " .. workDir .. "/patch.part* " .. workDir .. "/restore.part*")
-        os.remove(readbackPath)
-        downloadState = nil
-        installPosition = 0
-        busy = false
-
-        if itemIndex == fileCount then
-            phase = "done"
-            local complete = operation == "restore" and "모든 복원이" or "모든 패치가"
-            local update = operation == "patch"
-                and "\n펌웨어 업데이트시 재설치 후 복원이 필요할 수 있습니다." or ""
-            log(complete .. " 완료되었습니다.\n재부팅 후 정상적으로 사용하실 수 있습니다.\n\n"
-                .. "해당 워치페이스는 삭제하셔도 괜찮습니다." .. update)
-        else
-            itemIndex, phase = itemIndex + 1, "download"
-            log(actionName() .. " 완료.\n다음 파일을 받으려면 "
-                .. actionName() .. "버튼을 눌러주세요.")
-        end
+    local installPath = downloadDir .. "/" .. installName
+    local verifyPath = downloadDir .. "/" .. verifyName
+    local installStatus = downloadDir .. "/install.status"
+    local verifyStatus = downloadDir .. "/verify.status"
+    os.remove(installStatus)
+    if not exec("sh " .. installPath)
+        or not statusComplete(installStatus, "W", chunkCount) then
+        error("전체 기록에 실패했습니다.")
     end
 
-    local function nextPart()
-        if installPosition >= chunkCount then finish(); return end
-
-        -- ROMFS 엔트리 헤더가 포함된 조각들은 마지막에 기록한다.
-        local chunkIndex = order[installPosition + 1]
-        timer = lvgl.Timer {
-            period = 100, repeat_count = 1,
-            cb = function()
-                timer = nil
-                os.remove(readbackPath)
-                local filename, expected, blockSize, seek, count =
-                    chunkInfo(manifest, prefix, chunkIndex)
-                local part = filename and workDir .. "/" .. filename or ""
-                if not filename or size(part) ~= expected
-                    or expected ~= blockSize * count then
-                    fail("분할 파일 또는 기록 정보가 올바르지 않습니다.")
-                    return
-                end
-                local write = "dd if=" .. part .. " of=" .. deviceName
-                    .. " bs=" .. blockSize .. " seek=" .. seek
-                    .. " count=" .. count .. " conv=notrunc"
-                local verify = "dd if=" .. deviceName .. " of=" .. readbackPath
-                    .. " bs=" .. blockSize .. " skip=" .. seek .. " count=" .. count
-                if not exec(write) or not exec(verify)
-                    or not exec("cmp " .. part .. " " .. readbackPath) then
-                    fail("분할 기록 또는 검증에 실패했습니다.")
-                    return
-                end
-                os.remove(part)
-                installPosition = installPosition + 1
-                completed = completed + 1
-                log("설치중 " .. installPosition .. "/" .. chunkCount)
-                if installPosition >= chunkCount then
-                    nextPart()
-                elseif completed >= 5 then
-                    busy = false
-                    log(actionName() .. "를 계속하려면 " .. actionName() .. "버튼을 눌러주세요.")
-                else
-                    nextPart()
-                end
-            end,
-        }
-    end
-
-    nextPart()
+    timer = lvgl.Timer {
+        period = 100, repeat_count = 1,
+        cb = function()
+            timer = nil
+            os.remove(verifyStatus)
+            if not exec("sh " .. verifyPath)
+                or not statusComplete(verifyStatus, "V", chunkCount) then
+                busy = false
+                log("전체 검증에 실패했습니다. 다시 시도해주세요.")
+                return
+            end
+            exec("rm " .. downloadDir .. "/patch.part* "
+                .. downloadDir .. "/restore.part* " .. downloadDir .. "/*.sh "
+                .. downloadDir .. "/*.status " .. readbackPath .. "*")
+            downloadState = nil
+            if not saveProgress(itemIndex) then
+                busy = false
+                log("진행 상태를 저장할 수 없습니다.")
+                return
+            end
+            phase = "reboot"
+            if itemIndex == fileCount then
+                rebootWatch("모든 " .. actionName() .. "가 완료되었습니다.")
+            else
+                rebootWatch(currentName .. " 파일 " .. actionName() .. "가 완료되었습니다.")
+            end
+        end,
+    }
     return true
 end

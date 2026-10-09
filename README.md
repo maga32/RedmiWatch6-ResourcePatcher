@@ -50,7 +50,7 @@ node create-patch.js
 ```text
 output/patch/
 ├── messages/
-│   └── {patch.partNNN,restore.partNNN,manifest.json}
+│   └── {manifest.json,patch.partNNN,restore.partNNN,patch·restore 쉘}
 └── font/
     ├── MiSans-Demibold/
     ├── MiSans-Medium/
@@ -67,5 +67,8 @@ output/patch/
 - patch와 restore는 엔트리 헤더부터 다음 엔트리 직전까지 생성합니다.
 - 양쪽 비정렬 구간은 16바이트, 가운데 정렬 구간은 64KiB(65,536) 단위로 기록할 수 있게 분할합니다. 각 조각은 최대 1MiB입니다.
 - 모든 조각을 다시 결합하여 원본 payload와 같은지 자동 검증합니다.
+- 워치페이스는 Medium, Demibold, Regular, messages 순서로 파일 하나를 완료할 때마다 진행 상태를 저장하고 재부팅합니다.
+- 다운로드 조각은 `/data/tmp-patch/`에 개별 저장하며 다음 파일을 시작할 때 삭제합니다.
+- 생성된 설치·검증 쉘을 내려받아 실행하므로 Lua에서 긴 명령행을 만들지 않습니다.
 - 대상이 resource 최초 512바이트와 겹치면 자동 생성하지 않으며, 슈퍼블록 체크섬을 포함한 수동 작업이 필요합니다.
 - 1번을 다시 실행하면 기존 `input/` 내용이 삭제됩니다.
