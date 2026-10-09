@@ -3,7 +3,7 @@
 ## 0. 소개
 
 Redmi Watch 6의 full BIN에서 `vela_resource.bin`과 파일들을 추출하고,<br>
-리소스를 블록단위로 수정하여 패치를 적용하거나 복원할 수 있는 블록 패치를 생성하는 도구입니다.
+ROMFS 파일 엔트리 범위만 수정하거나 복원할 수 있는 패치를 생성하는 도구입니다.
 
 준비물:
 
@@ -49,20 +49,23 @@ node create-patch.js
 
 ```text
 output/patch/
-├── i18n/zh_CN/LC_MESSAGES/messages/
+├── messages/
 │   └── {patch.partNNN,restore.partNNN,manifest.json}
 └── font/
-    ├── MiSans-Demibold/{patch.partNNN,restore.partNNN,manifest.json}
-    ├── MiSans-Medium/{patch.partNNN,restore.partNNN,manifest.json}
-    └── MiSans-Regular/{patch.partNNN,restore.partNNN,manifest.json}
+    ├── MiSans-Demibold/
+    ├── MiSans-Medium/
+    └── MiSans-Regular/
 ```
+
+`output/patch/`의 내용을 `patches/<제품>/<버전>/`에 복사하여 배포합니다. 각 파일은 서로 독립적으로 패치하고 복원할 수 있습니다.
 
 주의사항:
 
 - `input/`에는 일반 교체 파일을 하나 이상 넣을 수 있습니다.
 - 폴더 구조와 파일명은 원본 resource 경로와 같아야 합니다.
 - 교체 파일은 원본 파일보다 클 수 없습니다.
-- patch와 restore는 1MiB 조각으로 생성하며, 모든 조각을 다시 결합하여 원본 payload와 같은지 자동 검증합니다.
-- 4KiB(4096) 블록을 공유하는 대상은 모든 교체 내용을 반영한 최종 이미지에서 패치를 생성하며, 정순·역순 적용 결과를 모두 검증합니다.
+- patch와 restore는 엔트리 헤더부터 다음 엔트리 직전까지 생성합니다.
+- 양쪽 비정렬 구간은 16바이트, 가운데 정렬 구간은 64KiB(65,536) 단위로 기록할 수 있게 분할합니다. 각 조각은 최대 1MiB입니다.
+- 모든 조각을 다시 결합하여 원본 payload와 같은지 자동 검증합니다.
 - 대상이 resource 최초 512바이트와 겹치면 자동 생성하지 않으며, 슈퍼블록 체크섬을 포함한 수동 작업이 필요합니다.
 - 1번을 다시 실행하면 기존 `input/` 내용이 삭제됩니다.

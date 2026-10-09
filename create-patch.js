@@ -10,8 +10,9 @@ const ROOT = __dirname;
 const INPUT = path.join(ROOT, 'input');
 const IMAGE = path.join(ROOT, 'output/extract/package/vela_resource.bin');
 const OUTPUT = path.join(ROOT, 'output/patch');
-const BLOCK_SIZE = 4096;
 const CHUNK_SIZE = 1024 * 1024;
+const FAST_BLOCK_SIZE = 64 * 1024;
+const EDGE_BLOCK_SIZE = 16;
 const ROMFS_MAGIC = Buffer.from('-rom1fs-');
 
 if (process.argv.includes('-h') || process.argv.includes('--help')) {
@@ -19,7 +20,7 @@ if (process.argv.includes('-h') || process.argv.includes('--help')) {
   node create-patch.js
 
 input/에 resource 경로대로 교체 파일을 넣습니다.
-결과: output/patch/<원본 경로>/<확장자를 뺀 파일명>/{patch.partNNN,restore.partNNN,manifest.json}`);
+결과: output/patch/파일별 폴더/{patch.partNNN,restore.partNNN,manifest.json}`);
     process.exit(0);
 }
 
@@ -186,38 +187,59 @@ function findRomfsEntries(image, base, size, wantedPath) {
     return found;
 }
 
-function outputRelativeDirectory(resourcePath) {
-    const parts = resourcePath.split('/').filter(Boolean);
-    const filename = parts.at(-1);
-    const extension = path.posix.extname(filename);
-    parts[parts.length - 1] = extension
-        ? filename.slice(0, -extension.length)
-        : filename;
-    return path.join(...parts);
-}
-
 function applyPayloads(baseImage, items, payloadKey, reverse = false) {
     const result = Buffer.from(baseImage);
     const ordered = reverse ? [...items].reverse() : items;
 
     for (const item of ordered) {
-        item[payloadKey].copy(result, item.blockStart);
+        item[payloadKey].copy(result, item.rangeStart);
     }
 
     return result;
 }
 
-function splitPayload(payload, prefix) {
+function splitPayload(payload, prefix, rangeStart) {
     const chunks = [];
-    const count = Math.ceil(payload.length / CHUNK_SIZE);
+    let payloadOffset = 0;
 
-    for (let index = 0; index < count; index += 1) {
-        const start = index * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, payload.length);
+    while (payloadOffset < payload.length) {
+        const deviceOffset = rangeStart + payloadOffset;
+        const edgeSize = deviceOffset % FAST_BLOCK_SIZE
+            ? FAST_BLOCK_SIZE - (deviceOffset % FAST_BLOCK_SIZE)
+            : 0;
+        const remaining = payload.length - payloadOffset;
+        let blockSize;
+        let size;
+
+        if (edgeSize) {
+            blockSize = EDGE_BLOCK_SIZE;
+            size = Math.min(edgeSize, remaining);
+        } else if (remaining >= FAST_BLOCK_SIZE) {
+            blockSize = FAST_BLOCK_SIZE;
+            size = Math.min(
+                Math.floor(remaining / FAST_BLOCK_SIZE) * FAST_BLOCK_SIZE,
+                CHUNK_SIZE,
+            );
+        } else {
+            blockSize = EDGE_BLOCK_SIZE;
+            size = remaining;
+        }
+
+        if (deviceOffset % blockSize || size % blockSize) {
+            throw new Error(`기록 조각 정렬 오류: ${hex(deviceOffset)}, ${size}`);
+        }
+
+        const index = chunks.length;
+        const end = payloadOffset + size;
         chunks.push({
             name: `${prefix}.part${String(index).padStart(3, '0')}`,
-            data: Buffer.from(payload.subarray(start, end)),
+            data: Buffer.from(payload.subarray(payloadOffset, end)),
+            deviceOffset,
+            blockSize,
+            seek: deviceOffset / blockSize,
+            count: size / blockSize,
         });
+        payloadOffset = end;
     }
 
     return chunks;
@@ -226,7 +248,6 @@ function splitPayload(payload, prefix) {
 async function collectTargets(image, romfsCandidates, inputPaths) {
     const rootRomfs = romfsCandidates[0];
     const targets = [];
-    const outputPaths = new Set();
 
     for (const relativePath of inputPaths.sort()) {
         const wantedPath = `/${relativePath.split(path.sep).join('/')}`;
@@ -259,7 +280,6 @@ async function collectTargets(image, romfsCandidates, inputPaths) {
         const replacement = await fsp.readFile(path.join(INPUT, relativePath));
         const oldEnd = entry.dataOffset + entry.size;
         const allocatedEnd = align(oldEnd, 16);
-        const outputRelative = outputRelativeDirectory(wantedPath);
 
         if (entry.type !== 2) {
             throw new Error(`일반 파일이 아님: ${wantedPath}`);
@@ -275,18 +295,12 @@ async function collectTargets(image, romfsCandidates, inputPaths) {
         if (entry.relativeOffset < Math.min(512, rootRomfs.size)) {
             throw new Error(`대상이 ROMFS 최초 512바이트와 겹침: ${wantedPath}`);
         }
-        if (outputPaths.has(outputRelative)) {
-            throw new Error(`출력 경로 충돌: ${outputRelative}`);
-        }
-
-        outputPaths.add(outputRelative);
         targets.push({
             wantedPath,
             entry,
             replacement,
             oldEnd,
             allocatedEnd,
-            outputRelative,
         });
     }
 
@@ -306,9 +320,9 @@ function buildFinalImage(originalImage, targets, romfsSize) {
         replacement.copy(finalImage, entry.dataOffset);
         finalImage.fill(0, entry.dataOffset + replacement.length, allocatedEnd);
 
-        target.blockStart = Math.floor(entry.offset / BLOCK_SIZE) * BLOCK_SIZE;
-        target.blockEnd = align(allocatedEnd, BLOCK_SIZE);
-        if (target.blockEnd > romfsSize) {
+        target.rangeStart = entry.offset;
+        target.rangeEnd = entry.next || allocatedEnd;
+        if (target.rangeEnd < allocatedEnd || target.rangeEnd > romfsSize) {
             throw new Error(`패치 범위 초과: ${target.wantedPath}`);
         }
     }
@@ -330,13 +344,29 @@ function buildFinalImage(originalImage, targets, romfsSize) {
     return finalImage;
 }
 
-function verifyApplicationOrder(originalImage, finalImage, generated) {
-    const unionStart = Math.min(...generated.map((item) => item.blockStart));
-    const unionEnd = Math.max(...generated.map((item) => item.blockEnd));
+function createItems(originalImage, finalImage, targets) {
+    return [...targets]
+        .sort((a, b) => a.rangeStart - b.rangeStart)
+        .map((target, index) => ({
+        id: `file-${String(index + 1).padStart(3, '0')}`,
+        outputPath: path.extname(target.wantedPath).toLowerCase() === '.ttf'
+            ? `font/${path.posix.basename(target.wantedPath, '.ttf')}`
+            : path.posix.basename(target.wantedPath, path.posix.extname(target.wantedPath)),
+        rangeStart: target.rangeStart,
+        rangeEnd: target.rangeEnd,
+        target,
+        patchPayload: Buffer.from(finalImage.subarray(target.rangeStart, target.rangeEnd)),
+        restorePayload: Buffer.from(originalImage.subarray(target.rangeStart, target.rangeEnd)),
+    }));
+}
+
+function verifyApplicationOrder(originalImage, finalImage, items) {
+    const unionStart = Math.min(...items.map((item) => item.rangeStart));
+    const unionEnd = Math.max(...items.map((item) => item.rangeEnd));
 
     for (const reverse of [false, true]) {
-        const patched = applyPayloads(originalImage, generated, 'patchPayload', reverse);
-        const restored = applyPayloads(finalImage, generated, 'restorePayload', reverse);
+        const patched = applyPayloads(originalImage, items, 'patchPayload', reverse);
+        const restored = applyPayloads(finalImage, items, 'restorePayload', reverse);
 
         if (!patched.subarray(unionStart, unionEnd)
             .equals(finalImage.subarray(unionStart, unionEnd))) {
@@ -349,86 +379,119 @@ function verifyApplicationOrder(originalImage, finalImage, generated) {
     }
 }
 
-function createManifest(originalImage, generated, item, patchChunks, restoreChunks) {
+function chunkMetadata(chunks) {
+    return chunks.map((chunk) => ({
+        name: chunk.name,
+        size: chunk.data.length,
+        sha256: sha256(chunk.data),
+        deviceOffset: { decimal: chunk.deviceOffset, hex: hex(chunk.deviceOffset) },
+        blockSize: chunk.blockSize,
+        seek: chunk.seek,
+        count: chunk.count,
+    }));
+}
+
+function verifyChunkLayout(item, chunks) {
+    let expectedOffset = item.rangeStart;
+
+    for (const chunk of chunks) {
+        if (chunk.deviceOffset !== expectedOffset
+            || ![EDGE_BLOCK_SIZE, FAST_BLOCK_SIZE].includes(chunk.blockSize)
+            || chunk.deviceOffset % chunk.blockSize
+            || chunk.data.length % chunk.blockSize
+            || chunk.seek * chunk.blockSize !== chunk.deviceOffset
+            || chunk.count * chunk.blockSize !== chunk.data.length) {
+            throw new Error(`기록 조각 검증 실패: ${item.outputPath}/${chunk.name}`);
+        }
+        expectedOffset += chunk.data.length;
+    }
+
+    if (expectedOffset !== item.rangeEnd) {
+        throw new Error(`기록 범위 검증 실패: ${item.outputPath}`);
+    }
+}
+
+function createItemManifest(originalImage, item, patchChunks, restoreChunks) {
     const number = (value) => ({ decimal: value, hex: hex(value) });
-    const overlappingTargets = generated
-        .filter((other) => other !== item
-            && item.blockStart < other.blockEnd
-            && other.blockStart < item.blockEnd)
-        .map((other) => other.wantedPath);
+    const commitChunks = [item.target].map((target) => (
+        patchChunks.findIndex((chunk) => (
+            target.entry.offset >= chunk.deviceOffset
+            && target.entry.offset < chunk.deviceOffset + chunk.data.length
+        ))
+    ));
+
+    if (commitChunks.some((index) => index < 0)) {
+        throw new Error(`헤더 조각을 찾지 못함: ${item.outputPath}`);
+    }
 
     return {
-        format: 'rw6-romfs-block-patch-v1',
+        format: 'rw6-romfs-entry-patch-v1',
+        id: item.id,
         source: {
             image: 'output/extract/package/vela_resource.bin',
             imageSize: originalImage.length,
             imageSha256: sha256(originalImage),
-            romfsBaseOffset: number(item.entry.romfsBase),
-            romfsDeclaredSize: number(item.entry.romfsSize),
-        },
-        batch: {
-            targetCount: generated.length,
-            targets: generated.map((target) => target.wantedPath),
-            overlappingTargets,
+            romfsBaseOffset: number(item.target.entry.romfsBase),
+            romfsDeclaredSize: number(item.target.entry.romfsSize),
         },
         target: {
-            device: '/dev/resource',
-            path: item.wantedPath,
-            entryOffset: number(item.entry.offset),
-            dataOffset: number(item.entry.dataOffset),
-            nextHeaderOffset: number(item.entry.next),
-            originalSize: number(item.entry.size),
-            newSize: number(item.replacement.length),
-            originalAllocatedEnd: number(item.allocatedEnd),
-            originalChecksum: hex(item.entry.checksum),
-            newChecksum: hex(item.newChecksum),
+            path: item.target.wantedPath,
+            entryOffset: number(item.target.entry.offset),
+            dataOffset: number(item.target.entry.dataOffset),
+            nextHeaderOffset: number(item.target.entry.next),
+            originalSize: number(item.target.entry.size),
+            newSize: number(item.target.replacement.length),
+            originalAllocatedEnd: number(item.target.allocatedEnd),
+            originalChecksum: hex(item.target.entry.checksum),
+            newChecksum: hex(item.target.newChecksum),
             originalFileSha256: sha256(
-                originalImage.subarray(item.entry.dataOffset, item.oldEnd),
+                originalImage.subarray(item.target.entry.dataOffset, item.target.oldEnd),
             ),
-            newFileSha256: sha256(item.replacement),
+            newFileSha256: sha256(item.target.replacement),
         },
         payload: {
             transfer: 'chunks',
-            blockSize: BLOCK_SIZE,
-            blockStart: number(item.blockStart),
-            blockEndExclusive: number(item.blockEnd),
+            device: '/dev/resource',
+            rangeStart: number(item.rangeStart),
+            rangeEndExclusive: number(item.rangeEnd),
             size: item.patchPayload.length,
-            seek: item.blockStart / BLOCK_SIZE,
-            count: item.patchPayload.length / BLOCK_SIZE,
             patchChunkPrefix: 'patch.part',
             patchChunkSize: CHUNK_SIZE,
             patchChunkCount: patchChunks.length,
-            patchLastChunkSize: patchChunks.at(-1).data.length,
             patchSha256: sha256(item.patchPayload),
+            patchChunks: chunkMetadata(patchChunks),
             restoreChunkPrefix: 'restore.part',
             restoreChunkSize: CHUNK_SIZE,
             restoreChunkCount: restoreChunks.length,
-            restoreLastChunkSize: restoreChunks.at(-1).data.length,
             restoreSha256: sha256(item.restorePayload),
+            restoreChunks: chunkMetadata(restoreChunks),
         },
         install: {
-            write: `dd if=/data/k of=/dev/resource bs=${BLOCK_SIZE} seek=${item.blockStart / BLOCK_SIZE} count=${item.patchPayload.length / BLOCK_SIZE} conv=notrunc`,
-            readback: `dd if=/dev/resource of=/data/r bs=${BLOCK_SIZE} skip=${item.blockStart / BLOCK_SIZE} count=${item.patchPayload.length / BLOCK_SIZE}`,
+            commitChunks: commitChunks.join(','),
+            fastBlockSize: FAST_BLOCK_SIZE,
+            edgeBlockSize: EDGE_BLOCK_SIZE,
             forbiddenOption: 'verify',
         },
     };
 }
 
-async function writeOutputs(originalImage, generated) {
+async function writeOutputs(originalImage, items) {
     await fsp.rm(OUTPUT, { recursive: true, force: true });
+    await fsp.mkdir(OUTPUT, { recursive: true });
     const summaries = [];
 
-    for (const item of generated) {
-        const patchChunks = splitPayload(item.patchPayload, 'patch');
-        const restoreChunks = splitPayload(item.restorePayload, 'restore');
-        const manifest = createManifest(
+    for (const item of items) {
+        const patchChunks = splitPayload(item.patchPayload, 'patch', item.rangeStart);
+        const restoreChunks = splitPayload(item.restorePayload, 'restore', item.rangeStart);
+        verifyChunkLayout(item, patchChunks);
+        verifyChunkLayout(item, restoreChunks);
+        const manifest = createItemManifest(
             originalImage,
-            generated,
             item,
             patchChunks,
             restoreChunks,
         );
-        const outputDirectory = path.join(OUTPUT, item.outputRelative);
+        const outputDirectory = path.join(OUTPUT, item.outputPath);
 
         await fsp.mkdir(outputDirectory, { recursive: true });
         await Promise.all([
@@ -460,18 +523,18 @@ async function writeOutputs(originalImage, generated) {
             || sha256(writtenPatch) !== manifest.payload.patchSha256
             || sha256(writtenRestore) !== manifest.payload.restoreSha256) {
             await fsp.rm(OUTPUT, { recursive: true, force: true });
-            throw new Error(`조각 출력 파일 재결합 검증 실패: ${item.wantedPath}`);
+            throw new Error(`조각 출력 파일 재결합 검증 실패: ${item.outputPath}`);
         }
 
         summaries.push({
-            targetPath: item.wantedPath,
+            id: item.id,
+            target: item.target.wantedPath,
             output: path.relative(ROOT, outputDirectory),
             payloadSize: item.patchPayload.length,
             patchChunkCount: patchChunks.length,
             restoreChunkCount: restoreChunks.length,
-            seek: item.blockStart / BLOCK_SIZE,
-            count: item.patchPayload.length / BLOCK_SIZE,
-            overlappingTargets: manifest.batch.overlappingTargets,
+            rangeStart: item.rangeStart,
+            rangeEndExclusive: item.rangeEnd,
         });
     }
 
@@ -500,18 +563,9 @@ async function main() {
         targets,
         romfsCandidates[0].size,
     );
-    const generated = targets.map((target) => ({
-        ...target,
-        patchPayload: Buffer.from(
-            finalImage.subarray(target.blockStart, target.blockEnd),
-        ),
-        restorePayload: Buffer.from(
-            originalImage.subarray(target.blockStart, target.blockEnd),
-        ),
-    }));
-
-    verifyApplicationOrder(originalImage, finalImage, generated);
-    const summaries = await writeOutputs(originalImage, generated);
+    const items = createItems(originalImage, finalImage, targets);
+    verifyApplicationOrder(originalImage, finalImage, items);
+    const summaries = await writeOutputs(originalImage, items);
 
     console.log(JSON.stringify(summaries, null, 2));
     console.log(`완료: ${OUTPUT}`);

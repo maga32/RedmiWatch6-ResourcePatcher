@@ -1,4 +1,4 @@
-# RW6 ROMFS 파일 블록 패치 표준
+# RW6 ROMFS 파일 엔트리 패치 표준
 
 ## 1. 무엇을 하려는가
 
@@ -8,13 +8,13 @@ Redmi Watch 6의 `/resource`는 읽기 전용 ROMFS라서 파일을 직접 덮�
 cp /data/messages.mo /resource/i18n/zh_CN/LC_MESSAGES/messages.mo
 ```
 
-대신 원본 장치 `/dev/resource`에서 해당 파일이 들어 있는 블록만 교체한다. 이 문서는 실제 대상인 다음 파일로 표준 방식을 설명한다.
+대신 원본 장치 `/dev/resource`에서 해당 파일의 ROMFS 엔트리 범위만 교체한다. 이 문서는 실제 대상인 다음 파일로 표준 방식을 설명한다.
 
 ```text
 /i18n/zh_CN/LC_MESSAGES/messages.mo
 ```
 
-사용자는 ROMFS 내부 전체 경로와 새 파일만 지정하고, 도구가 위치·크기·체크섬·블록을 계산한다.
+사용자는 ROMFS 내부 전체 경로와 새 파일만 지정하고, 도구가 위치·크기·체크섬·기록 범위를 계산한다.
 
 ## 2. 원본 파일을 경로로 찾는다
 
@@ -181,48 +181,55 @@ zeroEnd   = originalAllocatedEnd
 
 대상 파일의 사용 종료 영역은 0으로 지우고, 다음 엔트리와 다른 주변 데이터는 건드리지 않는다.
 
-## 9. 블록 payload와 `dd` 값을 계산한다
+## 9. 파일별 payload와 `dd` 값을 계산한다
 
-변경 범위는 엔트리 헤더부터 원본 파일 할당 끝까지다.
+payload 범위는 엔트리 헤더부터 다음 엔트리 헤더 직전까지다.
 
 ```text
 changedStart = 0x05bf9fe0
-changedEnd   = 0x05c43220
+changedEnd   = 0x05c43220  # 다음 엔트리 헤더 직전
 ```
 
-이를 포함하도록 4KiB(4096) 경계로 확장한다.
+이 범위를 주변 블록으로 확장하지 않고 그대로 payload로 만든다.
 
 ```text
-blockStart = 0x05bf9000
-blockEnd   = 0x05c44000
-payload    = 0x4b000 = 307,200바이트 = 75블록
-seek       = 0x05bf9000 / 4096 = 23545
-count      = 75
+payload = [0x05bf9fe0, 0x05c43220)
+size    = 299,584바이트
 ```
 
-공식 원본의 `[blockStart, blockEnd)`를 payload로 복사한 뒤 그 안에서 헤더, 새 파일과 0 정리 영역만 바꾼다.
+공식 원본의 해당 범위를 복사한 뒤 헤더, 새 파일과 0 정리 영역만 바꾼다. 다음 엔트리 헤더부터는 포함하지 않는다.
 
 ```text
-0x05bf9000
+0x05bf9fe0
 ┌──────────────────────────────────────────────┐
-│ 엔트리 앞부분: 원본 보존                     │
-├──────────────────────────────────────────────┤
 │ ROMFS 엔트리: size와 checksum만 변경          │
 ├──────────────────────────────────────────────┤
 │ 새 한국어 MO 287,660바이트                    │
 ├──────────────────────────────────────────────┤
 │ 새 EOF부터 기존 할당 끝: 0x00 11,892바이트    │
-├──────────────────────────────────────────────┤
-│ 다음 엔트리부터 블록 끝: 원본 보존            │
 └──────────────────────────────────────────────┘
-0x05c44000
+0x05c43220 (다음 엔트리 헤더, 미포함)
 ```
 
-기록 명령:
+입력 파일이 여러 개여도 각각 독립된 payload로 만든다. payload는 다음 방식으로 나누므로 빠르게 기록하면서 정확한 범위만 변경할 수 있다.
+
+- 엔트리 시작부터 다음 64KiB(65,536) 경계까지: 16바이트 단위
+- 가운데 정렬 구간: 64KiB(65,536) 단위, 조각당 최대 1MiB
+- 마지막 64KiB(65,536) 경계부터 payload 끝까지: 16바이트 단위
+
+`messages.mo`의 실제 분할 예:
+
+```text
+patch.part000  0x05bf9fe0부터 24,608바이트  bs=16
+patch.part001  0x05c00000부터 262,144바이트 bs=65536
+patch.part002  0x05c40000부터 12,832바이트  bs=16
+```
+
+각 조각은 manifest에 기록된 `blockSize`, `seek`, `count`를 그대로 사용한다.
 
 ```sh
-dd if=/data/k of=/dev/resource \
-  bs=4096 seek=23545 count=75 conv=notrunc
+dd if=patch.part001 of=/dev/resource \
+  bs=65536 seek=1472 count=4 conv=notrunc
 ```
 
 ## 10. 별도 readback 후 정상 재부팅한다
@@ -234,11 +241,11 @@ NuttX `dd`의 `verify` 옵션은 RW6 `/dev/resource` 부분 기록에서 변경�
 dd ... verify conv=notrunc
 ```
 
-기록 후 같은 블록을 별도 파일로 읽는다.
+기록 후 같은 범위를 별도 파일로 읽는다.
 
 ```sh
 dd if=/dev/resource of=/data/r \
-  bs=4096 skip=23545 count=75
+  bs=65536 skip=1472 count=4
 ```
 
 호스트에서 크기, SHA-256과 바이트가 payload와 모두 같은지 확인한다. 검증이 끝나면 `miwear`를 강제로 종료하지 않고 정상 재부팅해 새 리소스를 로드한다.
@@ -270,36 +277,34 @@ dataOffset + newSize <= originalAllocatedEnd
 
 ## 13. Lua 워치페이스 적용
 
-공개 배포에서는 `manifest.json`을 먼저 받고, 그 안의 조각 개수에 따라 `patch.part000`부터 차례로 내려받아 `/tmp/patch/`에서 하나의 payload로 결합한다. 복원할 때는 같은 방식으로 `restore.partNNN`을 사용한다.
+배포 구조는 네 파일별 디렉터리로 구성한다. 버전 디렉터리 바로 아래에는 별도 manifest를 두지 않는다.
 
 ```text
-patch.part000 ─┐
-patch.part001 ─┼─> 순서대로 결합 ─> manifest의 크기 확인 ─> dd 기록
-patch.partNNN ─┘
+messages/{manifest.json,patch.partNNN,restore.partNNN}
+font/MiSans-Regular/{manifest.json,patch.partNNN,restore.partNNN}
+font/MiSans-Medium/{manifest.json,patch.partNNN,restore.partNNN}
+font/MiSans-Demibold/{manifest.json,patch.partNNN,restore.partNNN}
 ```
 
-각 조각 다운로드는 별도 실행 단계로 처리한다. 모든 조각이 준비된 뒤 manifest의 `blockSize`, `seek`, `count`로 기록하고, 같은 범위를 다시 읽어 결합한 payload와 비교한다.
+Lua는 위 네 경로의 manifest를 각각 받아 모두 존재하는지 확인한 뒤 순서대로 처리한다. 패치는 `patch.partNNN`, 복원은 `restore.partNNN`을 `/tmp/patch/`에 직접 받으며 별도 payload로 결합하지 않는다. 다운로드는 버튼 한 번에 최대 7개, 기록은 최대 5개씩 처리한다.
 
-```sh
-dd if=/tmp/patch/payload of=/dev/resource \
-  bs=4096 seek=23545 count=75 conv=notrunc
-
-dd if=/dev/resource of=/tmp/patch/readback \
-  bs=4096 skip=23545 count=75
-
-cmp /tmp/patch/payload /tmp/patch/readback
+```text
+조각 다운로드 → 크기 확인 → manifest의 bs/seek/count로 기록
+             → 같은 범위 재읽기 → cmp → 임시 조각 삭제
 ```
 
-임시 파일은 `/tmp/patch/`에 두고 완료 후 삭제한다. 단일 `os.execute()` 작업은 10초 안에 완료가 예상되는 크기로 제한한다.
+각 다운로드와 기록은 별도의 LVGL 타이머 콜백에서 실행하여 조각마다 화면에 제어를 반환한다. ROMFS 엔트리 헤더가 든 `commitChunks`는 다른 조각의 기록과 검증이 끝난 뒤 마지막에 기록한다.
+
+manifest, 다운로드 조각과 readback 파일은 모두 `/tmp/patch/`에 두며 완료 후 삭제한다. `/data/`에는 임시 파일을 만들지 않는다. 단일 `os.execute()` 작업은 10초 안에 완료가 예상되는 크기로 제한한다.
 
 ## 14. 도구 출력과 필수 검증
 
 생성 파일:
 
 ```text
-patch.partNNN     1MiB 단위로 분할된 수정 블록 payload
-restore.partNNN   1MiB 단위로 분할된 공식 원본 블록
-manifest.json     경로, offset, 크기, 조각 정보, dd 값과 해시
+파일별/manifest.json          대상 경로, 범위, 조각, commitChunks와 해시
+파일별/patch.partNNN          수정 엔트리 payload
+파일별/restore.partNNN        공식 원본 엔트리 payload
 ```
 
 도구는 다음을 확인하고 하나라도 실패하면 출력을 만들지 않는다.
@@ -311,11 +316,12 @@ manifest.json     경로, offset, 크기, 조각 정보, dd 값과 해시
 새 파일이 원래 슬롯 안에 들어가는가
 수정한 size와 엔트리 체크섬이 유효한가
 새 EOF부터 슬롯 끝까지 모두 0인가
-payload 크기가 4KiB(4096) 배수이며 count × 4096과 같은가
-대상 밖의 블록 바이트가 원본과 같은가
-restore payload가 공식 원본 블록과 같은가
+각 조각의 시작·크기가 16 또는 64KiB 기록 단위에 맞는가
+모든 조각이 엔트리 시작부터 다음 엔트리 직전까지 빈틈없이 이어지는가
+restore payload가 공식 원본 엔트리 범위와 같은가
 모든 조각을 다시 결합한 결과가 원래 patch·restore payload와 같은가
 원본 복사본에 적용 후 대상 파일이 새 입력과 같은가
+전체 파일을 정순·역순으로 적용해도 최종 패치·복원 이미지가 같은가
 ```
 
 manifest에는 위 계산값, 조각 크기와 개수, 원본·새 파일·patch·restore의 SHA-256을 기록한다.

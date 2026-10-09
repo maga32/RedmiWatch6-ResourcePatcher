@@ -1,581 +1,421 @@
 local lvgl = require("lvgl")
 
-local screenWidth = lvgl.HOR_RES()
-local screenHeight = lvgl.VER_RES()
-local horizontalMargin = 20
-local verticalMargin = 50
-local gap = 8
-local buttonHeight = 60
-local contentWidth = screenWidth - horizontalMargin * 2
-local buttonY = screenHeight - verticalMargin - buttonHeight
-local logHeight = buttonY - verticalMargin - gap
+----------------------------- config -----------------------------
+local W, H = lvgl.HOR_RES(), lvgl.VER_RES()
+local margin, gap, buttonHeight = 20, 8, 60
+local contentWidth = W - margin * 2
+local buttonY = H - 50 - buttonHeight
 local buttonWidth = (contentWidth - gap * 2) // 3
-local patchDirectory = "/tmp/patch"
-local device
-local version
-productId = nil
-local patchStage = 0
-local patchBusy = false
-local patchTimer
-local downloadStates = {}
-local operationMode
-local patchBaseUrl = "https://raw.githubusercontent.com/maga32/RedmiWatch6-ResourcePatcher/main/patches/"
-local manifests = {
-    { remote = "messages/manifest.json", file = "messages-manifest.json" },
-    { remote = "font/MiSans-Demibold/manifest.json", file = "MiSans-Demibold-manifest.json" },
-    { remote = "font/MiSans-Medium/manifest.json", file = "MiSans-Medium-manifest.json" },
-    { remote = "font/MiSans-Regular/manifest.json", file = "MiSans-Regular-manifest.json" },
+
+local workDir = "/tmp/patch"
+local readbackPath = workDir .. "/readback.tmp"
+local baseUrl = "https://raw.githubusercontent.com/maga32/RedmiWatch6-ResourcePatcher/main/patches/"
+os.remove(readbackPath)
+
+-- 기기 및 작업 상태
+local device, version, productId, operation, packageUrl, currentName
+local itemManifests = {
+    "messages/manifest.json",
+    "font/MiSans-Regular/manifest.json",
+    "font/MiSans-Medium/manifest.json",
+    "font/MiSans-Demibold/manifest.json",
 }
+local phase, itemIndex, fileCount, installPosition = "need-info", 1, #itemManifests, 0
+local busy, timer, downloadState = false, nil, nil
+
+-- 최상위 function부 선언
+local newButton, log, read, size, exec, jsonString, jsonNumber, chunkInfo, actionName, later,
+    runOperation, getInfo, checkAvailability, downloadBatch, installCurrent
+
 local logText = table.concat({
     "레드미워치6 내수용 한글패치 (by. 룽즈)",
-    "-패치방법 : 정보확인 -> 패치",
-    "-복원방법 : 정보확인 -> 복원",
+    " - 패치방법 : 정보확인 -> 패치",
+    " - 복원방법 : 정보확인 -> 복원",
+    "",
+    " - 설정-화면꺼짐시간을 최대한 길게 적용한 후 진행하시는편이 좋습니다",
     "",
     "- 개발자는 이 툴의 사용으로 발생한 기기 손상 등에 대한 책임을 지지 않습니다.",
 }, "\n")
 
 local root = lvgl.Object(nil, {
-    w = screenWidth,
-    h = screenHeight,
-    align = lvgl.ALIGN.CENTER,
-    border_width = 0,
-    pad_all = 0,
-    bg_color = "#16181d",
+    w = W, h = H, align = lvgl.ALIGN.CENTER,
+    border_width = 0, pad_all = 0, bg_color = "#16181d",
 })
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
 root:add_flag(lvgl.FLAG.EVENT_BUBBLE)
 
--- 서버 조회, 패치 및 복구 결과를 표시할 스크롤 가능한 로그 창
 local logView = lvgl.Textarea(root, {
-    x = horizontalMargin,
-    y = verticalMargin,
-    w = contentWidth,
-    h = logHeight,
-    text = logText,
-    radius = 10,
-    border_width = 1,
-    border_color = "#454a55",
-    bg_color = "#252830",
-    text_color = "#e2e5eb",
-    text_font = lvgl.Font("MiSans-Medium", 18),
-    pad_all = 12,
+    x = margin, y = 50, w = contentWidth, h = buttonY - 58,
+    text = logText, radius = 10, border_width = 1,
+    border_color = "#454a55", bg_color = "#252830",
+    text_color = "#e2e5eb", text_font = lvgl.Font("MiSans-Medium", 18),
+    pad_all = 12, pad_bottom = 50,
 })
 logView:add_flag(lvgl.FLAG.SCROLLABLE)
 
-local function createActionButton(index, text, color)
-    local x = horizontalMargin + index * (buttonWidth + gap)
-
-    local button = lvgl.Object(root, {
-        x = x,
-        y = buttonY,
-        w = buttonWidth,
-        h = buttonHeight,
-        radius = 10,
-        border_width = 1,
-        border_color = color,
-        bg_color = "#252830",
-        pad_all = 0,
+function newButton(index, text, color)
+    local object = lvgl.Object(root, {
+        x = margin + index * (buttonWidth + gap), y = buttonY,
+        w = buttonWidth, h = buttonHeight, radius = 10,
+        border_width = 1, border_color = color,
+        bg_color = "#252830", pad_all = 0,
     })
-    button:clear_flag(lvgl.FLAG.SCROLLABLE)
-    button:add_flag(lvgl.FLAG.CLICKABLE)
-
-    lvgl.Label(button, {
-        text = text,
-        align = lvgl.ALIGN.CENTER,
-        border_width = 0,
-        bg_opa = 0,
-        text_color = color,
+    object:clear_flag(lvgl.FLAG.SCROLLABLE)
+    object:add_flag(lvgl.FLAG.CLICKABLE)
+    local label = lvgl.Label(object, {
+        text = text, align = lvgl.ALIGN.CENTER, border_width = 0,
+        bg_opa = 0, text_color = color,
         text_font = lvgl.Font("MiSans-Medium", 18),
     })
-
-    return button
+    return { object = object, label = label }
 end
 
-local function readFirstLine(path)
-    local file = io.open(path, "r")
-    if not file then
-        return nil
-    end
+----------------------------- 버튼 -----------------------------
 
-    local value = file:read("*l")
-    file:close()
-    os.remove(path)
+local infoButton = newButton(0, "정보확인", "#71b7ff")
+local patchButton = newButton(1, "패치", "#78d99b")
+local restoreButton = newButton(2, "복원", "#ff9a91")
 
-    return value
-end
+-- 정보확인 버튼
+infoButton.object:onevent(lvgl.EVENT.CLICKED, function()
+    getInfo()
+end)
 
-local function readFile(path)
-    local file = io.open(path, "r")
-    if not file then
-        return nil
-    end
+-- 패치 버튼
+patchButton.object:onevent(lvgl.EVENT.CLICKED, function()
+    runOperation(operation or "patch")
+end)
 
-    local value = file:read("*a")
-    file:close()
-    return value
-end
+-- 복원 버튼
+restoreButton.object:onevent(lvgl.EVENT.CLICKED, function()
+    runOperation("restore")
+end)
 
-local function appendLog(message)
+----------------------------- function -----------------------------
+
+-- 로그작성
+function log(message)
     logText = logText .. "\n" .. message
     logView:set { text = logText }
 end
 
-local function runAfterRefresh(action)
-    patchBusy = true
-    patchTimer = lvgl.Timer {
-        period = 100,
-        repeat_count = 1,
-        cb = function(timer)
-            local ok, asynchronous = pcall(action)
-            patchTimer = nil
-            if not ok then
-                patchBusy = false
-                appendLog("작업에 실패하였습니다. 다시 시도해주세요.\n오류: " .. tostring(asynchronous))
-            elseif asynchronous ~= true then
-                patchBusy = false
-            end
-        end,
-    }
+-- 파일 전체 or 첫 줄을 읽고 필요시 삭제
+function read(path, firstLine, remove)
+    local file = io.open(path, "rb")
+    if not file then return nil end
+    local value = file:read(firstLine and "*l" or "*a")
+    file:close()
+    if remove then os.remove(path) end
+    return value
 end
 
-local function ensurePatchDirectory()
-    if os.execute("test -d " .. patchDirectory) ~= true then
-        return os.execute("mkdir " .. patchDirectory) == true
-    end
-
-    return true
+-- 파일 크기 바이트 단위 리턴
+function size(path)
+    local file = io.open(path, "rb")
+    if not file then return nil end
+    local value = file:seek("end")
+    file:close()
+    return value
 end
 
-local function getInfo()
-    if operationMode then
-        appendLog("\n이미 " .. (operationMode == "patch" and "패치" or "복원") .. " 작업이 진행중입니다.")
-        return
-    end
-
-    patchStage = 0
-    downloadStates = {}
-
-    if not ensurePatchDirectory() then
-        appendLog("\n정보확인에 실패했습니다. 다시 시도해주세요.")
-        return
-    end
-
-    local devicePath = patchDirectory .. "/device"
-    local versionPath = patchDirectory .. "/version"
-
-    os.execute("uname -n >" .. devicePath)
-    os.execute("getprop ro.build.version >" .. versionPath)
-
-    device = readFirstLine(devicePath)
-    version = readFirstLine(versionPath)
-
-    productId = nil
-    if device and string.find(device, "REDMI Watch 6", 1, true) then
-        productId = "miwear.watch.p65"
-    end
-
-    if not device or device == "" or not version or version == "" or not productId then
-        appendLog("\n정보확인에 실패했습니다. 다시 시도해주세요.")
-        return
-    end
-
-    patchStage = 1
-
-    appendLog(table.concat({
-        "",
-        "device: " .. device,
-        "version: " .. version,
-        "패치 혹은 복원 버튼을 누르세요",
-    }, "\n"))
-end
-
-local function isValidManifest(path)
-    local content = readFile(path)
-    return content
-        and string.find(content, '"format":"rw6-romfs-block-patch-v1"', 1, true)
-        and string.find(content, '"patchSha256"', 1, true)
-        and string.find(content, '"restoreSha256"', 1, true)
-end
-
-local function commandSucceeded(command)
+-- 셸 명령 실행후 성공 여부 리턴
+function exec(command)
     local result, _, status = os.execute(command)
     return result == 0 or (result == true and (status == nil or status == 0))
 end
 
-local function fileSize(path)
-    local file = io.open(path, "rb")
-    if not file then
-        return nil
-    end
-
-    local size = file:seek("end")
-    file:close()
-    return size
-end
-
-local function manifestString(content, key)
-    return string.match(content, '"' .. key .. '"%s*:%s*"([^"]+)"')
-end
-
-local function manifestNumber(content, key)
-    local value = string.match(content, '"' .. key .. '"%s*:%s*(%d+)')
+-- manifest json에서 문자, 숫자 확인
+function jsonString(json, key) return string.match(json, '"' .. key .. '"%s*:%s*"([^"]+)"') end
+function jsonNumber(json, key)
+    local value = string.match(json, '"' .. key .. '"%s*:%s*(%d+)')
     return value and tonumber(value) or nil
 end
 
-local function startChunkDownload(options)
-    local manifest = readFile(options.manifestPath)
-    if not manifest then
-        error(options.manifestName .. "을 읽을 수 없습니다.")
-    end
+-- 청크 하나의 크기와 기록 위치를 manifest에서 읽기
+function chunkInfo(manifest, prefix, index)
+    local name = prefix .. ".part" .. string.format("%03d", index)
+    local body = string.match(manifest, '"name":"' .. name
+        .. '".-"blockSize":%d+,"seek":%d+,"count":%d+')
+    if not body then return nil end
+    return name, jsonNumber(body, "size"), jsonNumber(body, "blockSize"),
+        jsonNumber(body, "seek"), jsonNumber(body, "count")
+end
 
-    local payloadSize = manifestNumber(manifest, "size")
-    local chunkPrefix = options.operation == "restore" and "restore" or "patch"
-    local chunkSize = manifestNumber(manifest, chunkPrefix .. "ChunkSize")
-    local chunkCount = manifestNumber(manifest, chunkPrefix .. "ChunkCount")
-    local lastChunkSize = manifestNumber(manifest, chunkPrefix .. "LastChunkSize")
-    if manifestString(manifest, "transfer") ~= "chunks"
-        or not payloadSize or not chunkSize or not chunkCount or not lastChunkSize
-        or chunkCount < 1
-        or (chunkCount - 1) * chunkSize + lastChunkSize ~= payloadSize then
-        error(options.manifestName .. " 정보가 올바르지 않습니다.")
-    end
+-- 현재 작업 모드 리턴
+function actionName() return operation == "restore" and "복원" or "패치" end
 
-    local state = downloadStates[options.outputPath]
-    local signature = options.operation .. "/" .. productId .. "/" .. version .. "/" .. payloadSize
-    if not state or state.signature ~= signature then
-        os.remove(options.outputPath)
-        os.remove(options.tempPath)
-        state = { signature = signature, index = 0 }
-        downloadStates[options.outputPath] = state
-    end
-
-    local currentSize = fileSize(options.outputPath) or 0
-    if currentSize ~= state.index * chunkSize or currentSize > payloadSize then
-        os.remove(options.outputPath)
-        state.index = 0
-        currentSize = 0
-    end
-
-    local function fail(message)
-        os.remove(options.tempPath)
-        patchBusy = false
-        appendLog(options.failureMessage .. "\n오류: " .. message)
-    end
-
-    local function finish()
-        if fileSize(options.outputPath) ~= payloadSize then
-            os.remove(options.outputPath)
-            downloadStates[options.outputPath] = nil
-            fail("결합된 패치 파일 크기가 올바르지 않습니다.")
-            return
-        end
-
-        local ok, failure = pcall(options.onComplete, options.outputPath, manifest)
-        if not ok then
-            if options.restartOnFailure then
-                os.remove(options.outputPath)
-                downloadStates[options.outputPath] = nil
+-- 로그 먼저 갱신 후 작업실행, 중복 입력 방지
+function later(action)
+    busy = true
+    timer = lvgl.Timer {
+        period = 100, repeat_count = 1,
+        -- 예약작업의 성공,실패와 비동기 종료 여부 처리
+        cb = function()
+            timer = nil
+            local ok, asynchronous = pcall(action)
+            if not ok then
+                busy = false
+                log("작업에 실패하였습니다. 다시 시도해주세요.\n오류: " .. tostring(asynchronous))
+            elseif asynchronous ~= true then
+                busy = false
             end
-            fail(tostring(failure))
-            return
-        end
+        end,
+    }
+end
 
-        downloadStates[options.outputPath] = nil
-        patchBusy = false
+----------------------------- 작업 시작 -----------------------------
+
+-- 전체 작업 제어부
+function runOperation(requested)
+    if busy then return end
+    if phase == "need-info" then
+        log("\n정보확인 버튼을 먼저 눌러주세요")
+        return
+    end
+    if operation and operation ~= requested then
+        log("\n이미 " .. actionName() .. " 작업에 진입했습니다.")
+        return
+    end
+    operation = operation or requested
+
+    if phase == "ready" then
+        log("\n" .. actionName() .. " 확인중입니다.")
+        later(checkAvailability)
+    elseif phase == "download" then
+        log("\n" .. actionName() .. " 다운로드 ("
+            .. itemIndex .. "/" .. fileCount .. ")")
+        later(downloadBatch)
+    elseif phase == "install" then
+        log("\n" .. actionName() .. " 진행중 ("
+            .. itemIndex .. "/" .. fileCount .. ")")
+        later(installCurrent)
+    end
+end
+
+-- 1 정보확인: 기기명과 펌웨어 버전을 읽어 지원 모델 확인
+function getInfo()
+    if operation then
+        log("\n이미 " .. actionName() .. " 작업이 진행중입니다.")
+        return
+    end
+    if not exec("test -d " .. workDir) and not exec("mkdir " .. workDir) then
+        log("\n정보확인에 실패했습니다. 다시 시도해주세요.")
+        return
     end
 
-    local function scheduleNext()
-        if state.index >= chunkCount then
-            finish()
+    os.execute("uname -n >" .. workDir .. "/device")
+    os.execute("getprop ro.build.version >" .. workDir .. "/version")
+    device = read(workDir .. "/device", true, true)
+    version = read(workDir .. "/version", true, true)
+    productId = device and string.find(device, "REDMI Watch 6", 1, true)
+        and "miwear.watch.p65" or nil
+
+    if not productId or not version or version == "" then
+        phase = "need-info"
+        log("\n정보확인에 실패했습니다. 다시 시도해주세요.")
+        return
+    end
+    phase = "ready"
+    log("\ndevice: " .. device .. "\nversion: " .. version .. "\n패치 혹은 복원 버튼을 누르세요")
+end
+
+-- 2 패치확인: 패치에 필요한 네 파일 manifest를 각각 내려받아 검증
+function checkAvailability()
+    packageUrl = baseUrl .. productId .. "/" .. version .. "/"
+    for index, manifestPath in ipairs(itemManifests) do
+        itemIndex = index
+        local path = workDir .. "/file-" .. index .. ".json"
+        os.remove(path)
+        os.execute("curl " .. packageUrl .. manifestPath .. " -o" .. path)
+        local manifest = read(path)
+        if not manifest
+            or not string.find(manifest, '"format":"rw6-romfs-entry-patch-v1"', 1, true) then
+            itemIndex = 1
+            phase = "ready"
+            log("현재 패치 또는 복원이 불가능한 버전입니다. 다시 시도해보거나 네이버 카페에 문의해주세요.")
+            return
+        end
+    end
+    itemIndex = 1
+    phase = "download"
+    infoButton.object:add_flag(lvgl.FLAG.HIDDEN)
+    restoreButton.object:add_flag(lvgl.FLAG.HIDDEN)
+    patchButton.object:set { x = margin, w = contentWidth }
+    patchButton.label:set { text = actionName() }
+    log("해당버전 " .. actionName() .. "가 존재합니다. 한번 더 "
+        .. actionName() .. "버튼을 눌러주세요.")
+end
+
+-- 3 다운로드: 현재 파일의 청크를 한 번에 최대 7개씩 받기
+function downloadBatch()
+    local manifest = read(workDir .. "/file-" .. itemIndex .. ".json")
+    if not manifest then error("manifest를 읽을 수 없습니다.") end
+    currentName = string.match(jsonString(manifest, "path") or "", "([^/]+)$")
+
+    local prefix = operation == "restore" and "restore" or "patch"
+    local chunkCount = jsonNumber(manifest, prefix .. "ChunkCount")
+    if jsonString(manifest, "transfer") ~= "chunks" or not chunkCount then
+        error("manifest 정보가 올바르지 않습니다.")
+    end
+
+    local signature = operation .. "/" .. itemIndex
+    if not downloadState or downloadState.signature ~= signature then
+        exec("rm " .. workDir .. "/patch.part* " .. workDir .. "/restore.part*")
+        downloadState = { signature = signature, index = 0 }
+    end
+    if downloadState.index == 0 then
+        log(currentName .. " 파일을 다운로드 합니다.")
+    end
+
+    local completed = 0
+
+    -- 다음 청크 하나를 예약하고 완료 상태를 갱신
+    local function nextChunk()
+        local index = downloadState.index
+        if index >= chunkCount then
+            phase = "install"
+            installPosition = 0
+            busy = false
+            log("다운로드 완료. " .. actionName() .. "버튼을 눌러주세요.")
             return
         end
 
-        patchTimer = lvgl.Timer {
-            period = 100,
-            repeat_count = 1,
-            cb = function(timer)
-                patchTimer = nil
-                local index = state.index
-                local expectedSize = index == chunkCount - 1 and lastChunkSize or chunkSize
-                local filename = chunkPrefix .. ".part" .. string.format("%03d", index)
-                local url = options.remoteDirectory .. "/" .. filename
-                os.remove(options.tempPath)
-
-                if not commandSucceeded("curl " .. url .. " -o" .. options.tempPath)
-                    or fileSize(options.tempPath) ~= expectedSize then
-                    fail(filename .. " 다운로드에 실패했습니다.")
+        timer = lvgl.Timer {
+            period = 100, repeat_count = 1,
+            -- 예약된 청크를 내려받아 기존 payload 뒤에 결합
+            cb = function()
+                timer = nil
+                local filename, expected = chunkInfo(manifest, prefix, index)
+                local part = workDir .. "/" .. (filename or "invalid")
+                local directory = string.match(itemManifests[itemIndex], "^(.*)/manifest.json$")
+                os.remove(part)
+                if not filename or not directory
+                    or not exec("curl " .. packageUrl .. directory .. "/" .. filename .. " -o" .. part)
+                    or size(part) ~= expected then
+                    os.remove(part)
+                    busy = false
+                    log((filename or "청크") .. " 다운로드에 실패했습니다. 다시 시도해주세요.")
                     return
                 end
-
-                local appendCommand
-                if index == 0 then
-                    appendCommand = "cp " .. options.tempPath .. " " .. options.outputPath
+                downloadState.index = index + 1
+                completed = completed + 1
+                log("다운로드중 " .. downloadState.index .. "/" .. chunkCount)
+                if downloadState.index >= chunkCount then
+                    nextChunk()
+                elseif completed >= 7 then
+                    busy = false
+                    log("다운로드를 계속하려면 " .. actionName() .. "버튼을 눌러주세요.")
                 else
-                    appendCommand = "cat " .. options.tempPath .. " >>" .. options.outputPath
+                    nextChunk()
                 end
-                if not commandSucceeded(appendCommand) then
-                    fail(filename .. " 결합에 실패했습니다.")
-                    return
-                end
-
-                os.remove(options.tempPath)
-                state.index = index + 1
-                appendLog("다운로드 중 " .. state.index .. "/" .. chunkCount)
-                scheduleNext()
             end,
         }
     end
 
-    scheduleNext()
+    nextChunk()
     return true
 end
 
-local function installMessages(payloadPath, manifest, operation)
-    local readbackPath = patchDirectory .. "/messages-readback.bin"
-    local deviceName = manifestString(manifest, "device")
-    local blockSize = manifestNumber(manifest, "blockSize")
-    local payloadSize = manifestNumber(manifest, "size")
-    local seek = manifestNumber(manifest, "seek")
-    local count = manifestNumber(manifest, "count")
-    if deviceName ~= "/dev/resource" or not blockSize or not payloadSize or not seek or not count
-        or blockSize * count ~= payloadSize then
-        error("messages manifest 정보가 올바르지 않습니다.")
+-- 4 설치: 현재 파일의 청크를 지정된 16/64KiB 단위로 기록·검증
+function installCurrent()
+    local manifest = read(workDir .. "/file-" .. itemIndex .. ".json")
+    if installPosition == 0 then
+        log(currentName .. " 파일을 " .. actionName() .. "합니다.")
     end
 
-    appendLog("다운로드 완료. 패치 진행중입니다.")
-    local writeCommand = "dd if=" .. payloadPath .. " of=" .. deviceName
-        .. " bs=" .. blockSize .. " seek=" .. seek .. " count=" .. count .. " conv=notrunc"
-    if not commandSucceeded(writeCommand) then
-        error("/dev/resource 기록에 실패했습니다.")
+    local prefix = operation == "restore" and "restore" or "patch"
+    local deviceName = manifest and jsonString(manifest, "device")
+    local chunkCount = manifest and jsonNumber(manifest, prefix .. "ChunkCount")
+    local commitChunks = manifest and jsonString(manifest, "commitChunks")
+    if jsonString(manifest or "", "transfer") ~= "chunks"
+        or deviceName ~= "/dev/resource" or not chunkCount or not commitChunks then
+        error("manifest가 올바르지 않습니다.")
     end
 
-    local readCommand = "dd if=" .. deviceName .. " of=" .. readbackPath
-        .. " bs=" .. blockSize .. " skip=" .. seek .. " count=" .. count
-    if not commandSucceeded(readCommand)
-        or not commandSucceeded("cmp " .. payloadPath .. " " .. readbackPath) then
+    local commit, order = {}, {}
+    for value in string.gmatch(commitChunks, "%d+") do
+        commit[tonumber(value)] = true
+    end
+    for index = 0, chunkCount - 1 do
+        if not commit[index] then order[#order + 1] = index end
+    end
+    for index = 0, chunkCount - 1 do
+        if commit[index] then order[#order + 1] = index end
+    end
+    local completed = 0
+    busy = true
+
+    local function fail(message)
         os.remove(readbackPath)
-        error("기록 후 검증에 실패했습니다.")
+        busy = false
+        log(actionName() .. "에 실패하였습니다. 다시 시도해주세요.\n오류: " .. message)
     end
 
-    os.remove(readbackPath)
-    os.remove(payloadPath)
-    patchStage = 3
-    if operation == "restore" then
-        appendLog("한글메뉴 복원 완료. 폰트를 복원합니다.\n복원버튼을 눌러주세요 (1/6)")
-    else
-        appendLog("한글메뉴 패치 완료. 한글깨짐을 방지하기 위해 폰트를 다운받습니다.\n패치버튼을 눌러주세요 (1/6)")
-    end
-end
+    local function finish()
+        exec("rm " .. workDir .. "/patch.part* " .. workDir .. "/restore.part*")
+        os.remove(readbackPath)
+        downloadState = nil
+        installPosition = 0
+        busy = false
 
-local function processMessages(operation)
-    local actionName = operation == "restore" and "복원" or "패치"
-    return startChunkDownload {
-        operation = operation,
-        manifestPath = patchDirectory .. "/messages-manifest.json",
-        manifestName = "messages-manifest.json",
-        remoteDirectory = patchBaseUrl .. productId .. "/" .. version .. "/messages",
-        outputPath = patchDirectory .. "/messages-" .. operation .. ".bin",
-        tempPath = patchDirectory .. "/messages-part.tmp",
-        failureMessage = "한글메뉴 " .. actionName .. "에 실패하였습니다. 다시 시도해주세요.",
-        restartOnFailure = true,
-        onComplete = function(payloadPath, manifest)
-            installMessages(payloadPath, manifest, operation)
-        end,
-    }
-end
-
-local function downloadFont(operation, fontName, nextStage, nextProgress)
-    return startChunkDownload {
-        operation = operation,
-        manifestPath = patchDirectory .. "/" .. fontName .. "-manifest.json",
-        manifestName = fontName .. "-manifest.json",
-        remoteDirectory = patchBaseUrl .. productId .. "/" .. version .. "/font/" .. fontName,
-        outputPath = patchDirectory .. "/" .. fontName .. "-" .. operation .. ".bin",
-        tempPath = patchDirectory .. "/" .. fontName .. "-part.tmp",
-        failureMessage = "폰트 다운로드에 실패하였습니다. 다시 시도해주세요.",
-        onComplete = function(patchPath, manifest)
-            patchStage = nextStage
-            local buttonName = operation == "restore" and "복원" or "패치"
-            appendLog("폰트 다운로드 완료. " .. buttonName .. "버튼을 눌러주세요 (" .. nextProgress .. "/6)")
-        end,
-    }
-end
-
-local function installFont(operation, fontName, nextStage, nextProgress)
-    local patchPath = patchDirectory .. "/" .. fontName .. "-" .. operation .. ".bin"
-    local readbackPath = patchDirectory .. "/" .. fontName .. "-readback.bin"
-    os.remove(readbackPath)
-    local ok, failure = pcall(function()
-        local manifest = readFile(patchDirectory .. "/" .. fontName .. "-manifest.json")
-        if not manifest then
-            error(fontName .. "-manifest.json을 읽을 수 없습니다.")
-        end
-
-        local deviceName = manifestString(manifest, "device")
-        local blockSize = manifestNumber(manifest, "blockSize")
-        local payloadSize = manifestNumber(manifest, "size")
-        local seek = manifestNumber(manifest, "seek")
-        local count = manifestNumber(manifest, "count")
-        if manifestString(manifest, "transfer") ~= "chunks"
-            or deviceName ~= "/dev/resource"
-            or not blockSize or not payloadSize or not seek or not count
-            or blockSize * count ~= payloadSize or fileSize(patchPath) ~= payloadSize then
-            error(fontName .. " 작업 정보 또는 파일이 올바르지 않습니다.")
-        end
-
-        local writeCommand = "dd if=" .. patchPath .. " of=" .. deviceName
-            .. " bs=" .. blockSize .. " seek=" .. seek .. " count=" .. count .. " conv=notrunc"
-        if not commandSucceeded(writeCommand) then
-            error("/dev/resource 기록에 실패했습니다.")
-        end
-
-        local readCommand = "dd if=" .. deviceName .. " of=" .. readbackPath
-            .. " bs=" .. blockSize .. " skip=" .. seek .. " count=" .. count
-        if not commandSucceeded(readCommand)
-            or not commandSucceeded("cmp " .. patchPath .. " " .. readbackPath) then
-            error("기록 후 검증에 실패했습니다.")
-        end
-    end)
-
-    os.remove(readbackPath)
-    if not ok then
-        local actionName = operation == "restore" and "복원" or "패치"
-        appendLog("폰트 " .. actionName .. "에 실패하였습니다. 다시 시도해주세요.\n오류: " .. tostring(failure))
-        return
-    end
-
-    os.remove(patchPath)
-    patchStage = nextStage
-    if nextStage == 9 then
-        if operation == "restore" then
-            appendLog(table.concat({
-                "모든 복원이 완료되었습니다.",
-                "재부팅 후 정상적으로 사용하실 수 있습니다.",
-                "",
-                "해당 워치페이스는 삭제하셔도 괜찮습니다.",
-            }, "\n"))
+        if itemIndex == fileCount then
+            phase = "done"
+            local complete = operation == "restore" and "모든 복원이" or "모든 패치가"
+            local update = operation == "patch"
+                and "\n펌웨어 업데이트시 재설치 후 복원이 필요할 수 있습니다." or ""
+            log(complete .. " 완료되었습니다.\n재부팅 후 정상적으로 사용하실 수 있습니다.\n\n"
+                .. "해당 워치페이스는 삭제하셔도 괜찮습니다." .. update)
         else
-            appendLog(table.concat({
-                "모든 패치가 완료되었습니다.",
-                "재부팅 후 정상적으로 사용하실 수 있습니다.",
-                "",
-                "해당 워치페이스는 삭제하셔도 괜찮습니다.",
-                "펌웨어 업데이트시 재설치 후 복원이 필요할 수 있습니다.",
-            }, "\n"))
-        end
-        return
-    end
-
-    local actionName = operation == "restore" and "복원" or "설치"
-    local buttonName = operation == "restore" and "복원" or "패치"
-    appendLog("폰트 " .. actionName .. " 완료. 다음 폰트를 다운로드합니다.\n"
-        .. buttonName .. "버튼을 눌러주세요 (" .. nextProgress .. "/6)")
-end
-
-local function checkPatchAvailability()
-    local baseUrl = patchBaseUrl .. productId .. "/" .. version .. "/"
-    for _, manifest in ipairs(manifests) do
-        local destination = patchDirectory .. "/" .. manifest.file
-        os.remove(destination)
-        os.execute("curl " .. baseUrl .. manifest.remote .. " -o" .. destination)
-
-        if not isValidManifest(destination) then
-            patchStage = 1
-            appendLog("현재 패치 또는 복원이 불가능한 버전입니다. 다시 시도해보거나 네이버 카페에 문의해주세요.")
-            return
+            itemIndex, phase = itemIndex + 1, "download"
+            log(actionName() .. " 완료.\n다음 파일을 받으려면 "
+                .. actionName() .. "버튼을 눌러주세요.")
         end
     end
 
-    patchStage = 2
-    local actionName = operationMode == "restore" and "복원" or "패치"
-    appendLog("해당버전 " .. actionName .. " 파일이 존재합니다. 한번 더 " .. actionName .. "버튼을 눌러주세요.")
+    local function nextPart()
+        if installPosition >= chunkCount then finish(); return end
+
+        -- ROMFS 엔트리 헤더가 포함된 조각들은 마지막에 기록한다.
+        local chunkIndex = order[installPosition + 1]
+        timer = lvgl.Timer {
+            period = 100, repeat_count = 1,
+            cb = function()
+                timer = nil
+                os.remove(readbackPath)
+                local filename, expected, blockSize, seek, count =
+                    chunkInfo(manifest, prefix, chunkIndex)
+                local part = filename and workDir .. "/" .. filename or ""
+                if not filename or size(part) ~= expected
+                    or expected ~= blockSize * count then
+                    fail("분할 파일 또는 기록 정보가 올바르지 않습니다.")
+                    return
+                end
+                local write = "dd if=" .. part .. " of=" .. deviceName
+                    .. " bs=" .. blockSize .. " seek=" .. seek
+                    .. " count=" .. count .. " conv=notrunc"
+                local verify = "dd if=" .. deviceName .. " of=" .. readbackPath
+                    .. " bs=" .. blockSize .. " skip=" .. seek .. " count=" .. count
+                if not exec(write) or not exec(verify)
+                    or not exec("cmp " .. part .. " " .. readbackPath) then
+                    fail("분할 기록 또는 검증에 실패했습니다.")
+                    return
+                end
+                os.remove(part)
+                installPosition = installPosition + 1
+                completed = completed + 1
+                log("설치중 " .. installPosition .. "/" .. chunkCount)
+                if installPosition >= chunkCount then
+                    nextPart()
+                elseif completed >= 5 then
+                    busy = false
+                    log(actionName() .. "를 계속하려면 " .. actionName() .. "버튼을 눌러주세요.")
+                else
+                    nextPart()
+                end
+            end,
+        }
+    end
+
+    nextPart()
+    return true
 end
-
-local function runOperation(requestedMode)
-    if patchBusy then
-        return
-    end
-
-    if patchStage == 0 then
-        appendLog("\n정보확인 버튼을 먼저 눌러주세요")
-        return
-    end
-
-    if operationMode and operationMode ~= requestedMode then
-        local actionName = operationMode == "restore" and "복원" or "패치"
-        appendLog("\n이미 " .. actionName .. " 작업에 진입했습니다.")
-        return
-    end
-
-    if not operationMode then
-        operationMode = requestedMode
-    end
-
-    local restoring = operationMode == "restore"
-    local actionName = restoring and "복원" or "패치"
-
-    if patchStage == 2 then
-        appendLog("\n한글메뉴 " .. actionName .. " 파일 다운로드 중입니다.")
-        runAfterRefresh(function() return processMessages(operationMode) end)
-        return
-    end
-
-    if patchStage == 3 then
-        appendLog("\n폰트 다운로드 시작(1/6)")
-        runAfterRefresh(function() return downloadFont(operationMode, "MiSans-Regular", 4, 2) end)
-        return
-    end
-
-    if patchStage == 4 then
-        appendLog("\n폰트 " .. actionName .. " 진행중입니다.(2/6)")
-        runAfterRefresh(function() installFont(operationMode, "MiSans-Regular", 5, 3) end)
-        return
-    end
-
-    if patchStage == 5 then
-        appendLog("\n폰트 다운로드 시작(3/6)")
-        runAfterRefresh(function() return downloadFont(operationMode, "MiSans-Demibold", 6, 4) end)
-        return
-    end
-
-    if patchStage == 6 then
-        appendLog("\n폰트 " .. actionName .. " 진행중입니다.(4/6)")
-        runAfterRefresh(function() installFont(operationMode, "MiSans-Demibold", 7, 5) end)
-        return
-    end
-
-    if patchStage == 7 then
-        appendLog("\n폰트 다운로드 시작(5/6)")
-        runAfterRefresh(function() return downloadFont(operationMode, "MiSans-Medium", 8, 6) end)
-        return
-    end
-
-    if patchStage == 8 then
-        appendLog("\n폰트 " .. actionName .. " 진행중입니다.(6/6)")
-        runAfterRefresh(function() installFont(operationMode, "MiSans-Medium", 9, nil) end)
-        return
-    end
-
-    if patchStage ~= 1 then
-        return
-    end
-
-    appendLog("\n" .. actionName .. " 확인중입니다.")
-    runAfterRefresh(checkPatchAvailability)
-end
-
-local getInfoButton = createActionButton(0, "정보확인", "#71b7ff")
-local patchButton = createActionButton(1, "패치", "#78d99b")
-local restoreButton = createActionButton(2, "복원", "#ff9a91")
-
-getInfoButton:onevent(lvgl.EVENT.CLICKED, function(obj, code)
-    getInfo()
-end)
-
-patchButton:onevent(lvgl.EVENT.CLICKED, function(obj, code)
-    runOperation("patch")
-end)
-
-restoreButton:onevent(lvgl.EVENT.CLICKED, function(obj, code)
-    runOperation("restore")
-end)
