@@ -57,7 +57,7 @@ output/patch/
     └── MiSans-Regular/
 ```
 
-`output/patch/`의 내용을 `patches/<제품>/<버전>/`에 복사하여 배포합니다. 각 파일은 서로 독립적으로 패치하고 복원할 수 있습니다.
+`output/patch/`의 내용을 `patches/<제품>/korean/<버전>/`에 복사하여 배포합니다. 각 파일은 서로 독립적으로 패치하고 복원할 수 있습니다.
 
 주의사항:
 

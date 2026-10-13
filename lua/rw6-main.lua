@@ -12,6 +12,8 @@ local downloadDir = "/data/tmp-patch"
 local readbackPath = downloadDir .. "/readback.tmp"
 local statePath = "/data/rw6patch.state"
 local baseUrl = "https://raw.githubusercontent.com/maga32/RedmiWatch6-ResourcePatcher/main/patches/"
+local subPatch = "/korean/"
+local subOperation = "kor-patch"
 os.remove(readbackPath)
 
 -- 기기 및 작업 상태
@@ -47,7 +49,7 @@ root:add_flag(lvgl.FLAG.EVENT_BUBBLE)
 
 local warning = lvgl.Label(root, {
     x = margin+10, y = 50, w = contentWidth, h = 50,
-    text = "*설정-디스플레이-자동잠금시간을 최대한 길게 적용하면 중단위험이 적어집니다.",
+    text = "* 긴 화면꺼짐시간, 빠른 네트워크 환경으로 작업시 중단위험이 적습니다.",
     text_color = "#ffd166", text_font = lvgl.Font("MiSans-Medium", 18),
 })
 
@@ -85,7 +87,9 @@ local restoreButton = newButton(2, "복원", "#ff9a91")
 
 -- 정보확인 버튼
 infoButton.object:onevent(lvgl.EVENT.CLICKED, function()
-    getInfo()
+    if busy then return end
+    log("\n정보확인 중입니다.")
+    later(getInfo)
 end)
 
 -- 패치 버튼
@@ -164,7 +168,8 @@ function actionName() return operation == "restore" and "복원" or "패치" end
 
 -- 현재 패치 또는 복원의 고유 이름
 function operationId()
-    return operation == "restore" and "kor-patch.restore" or "kor-patch.patch"
+    return operation == "restore" and subOperation .. ".restore"
+        or subOperation .. ".patch"
 end
 
 -- 재부팅 후 이어갈 작업 정보와 0부터 시작하는 다음 파일 번호 저장
@@ -209,7 +214,7 @@ end
 
 -- 상태 저장 후 화면 로그를 갱신하고 워치 재부팅
 function rebootWatch(message)
-    log(message .. "\n5초뒤 자동으로 재부팅합니다.")
+    log(message .. "\nRebooting in 5 seconds.")
     busy = true
     timer = lvgl.Timer {
         period = 5000, repeat_count = 1,
@@ -296,12 +301,13 @@ function getInfo()
         return
     end
     phase = "ready"
-    log("\ndevice: " .. device .. "\nversion: " .. version .. "\n패치 혹은 복원 버튼을 누르세요")
+    log("\ndevice: " .. device .. "\nversion: " .. version)
+    log("패치 혹은 복원 버튼을 누르세요")
 end
 
--- 2 패치확인: 패치에 필요한 네 파일 manifest를 각각 내려받아 검증
+-- 2 패치확인: 대상 파일 manifest를 각각 내려받아 검증
 function checkAvailability()
-    packageUrl = baseUrl .. productId .. "/" .. version .. "/"
+    packageUrl = baseUrl .. productId .. subPatch .. version .. "/"
     for index, manifestPath in ipairs(itemManifests) do
         itemIndex = index
         local path = workDir .. "/file-" .. index .. ".json"
@@ -350,7 +356,7 @@ function downloadBatch()
         downloadState = { signature = signature, index = 0 }
     end
     if downloadState.index == 0 then
-        log(currentName .. " 파일을 다운로드 합니다.")
+        log(currentName .. " 파일을 다운로드 중입니다.")
     end
 
     local completed = 0
@@ -421,7 +427,7 @@ end
 -- 4 설치: JS가 생성한 쉘로 전체 기록 후 다음 타이머에서 전체 검증
 function installCurrent()
     local manifest = read(workDir .. "/file-" .. itemIndex .. ".json")
-    log(currentName .. " 파일을 " .. actionName() .. "합니다.")
+    log(currentName .. " 파일을 " .. actionName() .. "중입니다.")
 
     local prefix = operation == "restore" and "restore" or "patch"
     local chunkCount = manifest and jsonNumber(manifest, prefix .. "ChunkCount")
@@ -466,11 +472,14 @@ function installCurrent()
                 log("진행 상태를 저장할 수 없습니다.")
                 return
             end
+            if not exec("rmdir " .. downloadDir) then
+                log("임시 폴더를 삭제하지 못했습니다.")
+            end
             phase = "reboot"
             if itemIndex == fileCount then
-                rebootWatch("모든 " .. actionName() .. " 작업이 완료되었습니다.")
+                rebootWatch("All patches are complete.")
             else
-                rebootWatch(currentName .. " 파일 " .. actionName() .. " 작업이 완료되었습니다.")
+                rebootWatch(currentName .. " file " .. operation .. " is complete.")
             end
         end,
     }
