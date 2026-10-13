@@ -30,7 +30,7 @@ local busy, timer, downloadState = false, nil, nil
 -- 최상위 function부 선언
 local newButton, log, read, size, exec, jsonString, jsonNumber, chunkInfo, statusComplete, actionName,
     operationId, saveProgress, loadProgress, clearTemporary, rebootWatch, later, runOperation, getInfo,
-    checkAvailability, downloadBatch, installCurrent
+    checkAvailability, checkStorage, downloadBatch, installCurrent
 
 local logText = table.concat({
     "레드미워치6 내수용 한글패치 (by. 룽즈)",
@@ -134,6 +134,29 @@ end
 function exec(command)
     local result, _, status = os.execute(command)
     return result == 0 or (result == true and (status == nil or status == 0))
+end
+
+-- 다운로드 시작 전 /data 여유 공간 확인 (15MiB 초과 필요)
+function checkStorage()
+    local file = workDir .. "/df"
+    os.remove(file)
+    local ok = exec("df >" .. file)
+    local output = read(file, false, true) or ""
+    if ok then
+        for line in string.gmatch(output, "[^\r\n]+") do
+            local blockSize, available = string.match(line,
+                "^%s*(%d+)%s+%d+%s+%d+%s+(%d+)%s+/data%s*$")
+            if blockSize then
+                if tonumber(blockSize) * tonumber(available) > 15 * 1024 * 1024 then
+                    return true
+                end
+                log("저장공간부족, 워치페이스나 음성녹음의 삭제가 필요합니다.")
+                return false
+            end
+        end
+    end
+    log("저장공간을 확인하지 못했습니다. 다시 시도해주세요.")
+    return false
 end
 
 -- manifest json에서 문자, 숫자 확인
@@ -354,6 +377,7 @@ function downloadBatch()
     local signature = operation .. "/" .. itemIndex
     if not downloadState or downloadState.signature ~= signature then
         clearTemporary()
+        if not checkStorage() then return end
         downloadState = { signature = signature, index = 0 }
     end
     if downloadState.index == 0 then
