@@ -7,3 +7,5 @@ watchface/*/output/
 
 *.log
 .DS_Store
+
+dev/
